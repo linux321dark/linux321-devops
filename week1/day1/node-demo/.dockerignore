@@ -1,0 +1,9 @@
+.git
+node_modules
+target
+dist
+__pycache__
+*.md
+Dockerfile
+.dockerignore
+vendor
