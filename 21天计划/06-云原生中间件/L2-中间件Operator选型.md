@@ -496,6 +496,230 @@ kubectl get crd | grep -i redis
 > **面试这么答**（这是本篇最能体现判断力的一段）：
 > "中间件上 K8s 我不一刀切。**判断标准是出事的时候我们能不能救回来**——不是技术上能不能，是团队能力和值班机制上能不能。10 几人团队没有专职 SRE 和 DBA，凌晨主库挂了，判断'是磁盘问题还是复制问题''能不能在存储层面回滚'这种判断需要积累，不是看两篇文章能有的。**所以我的建议是：数据库用云托管，日志和缓存这类数据可重建的用 Operator 化部署。** 这不是保守，是算过期望成本。"
 
+### 3.6 常用运维命令面板（Redis + PostgreSQL）
+
+> **本节能做什么**：3.1–3.5 讲的是"怎么把中间件跑起来、怎么选型"，本节补的是**你真正值班 / 面试被追问时会敲的日常运维命令**——Redis 用 `redis-cli`、PostgreSQL 用 `psql` 与系统视图。每条配真实例子与"实战价值"。**这俩库是你面试的重点栈，务必练到能闭眼敲。**
+>
+> **重要前提**：下面命令默认你已连上实例。`redis-cli` 连远程用 `redis-cli -h <host> -p <port> -a <pass>`（密码建议走 `-a` 或 `REDISCLI_AUTH` 环境变量，避免明文落在命令行历史）；`psql` 连远程用 `psql -h <host> -p <port> -U <user> -d <db>`。生产连法（连接串、SSL、连接池）在配置管理篇讲，本段只列命令。
+
+#### ① Redis · 实例健康与容量（INFO 分段解读）
+
+```bash
+redis-cli INFO                       # 全量：server/clients/memory/persistence/stats/replication/cpu/keyspace
+redis-cli INFO memory                # 只看内存段：used_memory / used_memory_rss / mem_fragmentation_ratio
+redis-cli INFO clients               # 客户端：connected_clients / blocked_clients / rejected_connections
+redis-cli INFO stats                 # 统计：total_commands_processed / instantaneous_ops_per_sec / evicted_keys
+redis-cli INFO server                # 版本/运行模式/运行天数：redis_version / uptime_in_days / redis_mode
+redis-cli INFO keyspace              # 各 DB 的 key 数与 expired 数：db0:keys=1200,expires=300,avg_ttl=...
+redis-cli DBSIZE                     # 当前 DB 的 key 总数（比 INFO keyspace 更轻量）
+```
+
+> **实战价值**：`INFO memory` 的 `mem_fragmentation_ratio`（RSS/used）>1.5 说明碎片高，考虑 `activedefrag` 或重启；`INFO stats` 的 `evicted_keys`/`expired_keys` 突增往往意味着内存淘汰或集中过期在拉低命中率；`INFO replication` 配合 ⑦ 看主从。面试常问"怎么判断 Redis 内存够不够"——就是这一组。
+
+#### ② Redis · key 探查（KEYS 危险，用 SCAN）
+
+```bash
+redis-cli KEYS "*"                              # ⚠️ 生产禁用！单线程阻塞，key 多时直接卡死全实例
+redis-cli --scan --count 100                    # ✅ 游标迭代，不阻塞：默认每次 100 条
+redis-cli --scan --pattern "order:*" --count 500   # 按模式安全扫描
+redis-cli TYPE order:1001                       # key 是什么类型（string/hash/list/set/zset）
+redis-cli TTL order:1001                         # 剩余过期秒数（-1 永不过期，-2 已不存在）
+redis-cli PTTL order:1001                        # 毫秒级剩余时间
+redis-cli EXPIRE order:1001 3600                 # 设 1 小时过期（发布时给缓存键加版本+过期，天然失效）
+```
+
+> **实战价值**：`KEYS *` 在百万 key 实例上能卡几十秒，期间所有请求超时——**这是生产事故级操作**，面试必须主动说"生产用 SCAN 不用 KEYS"。`EXPIRE` 配合发布时的"缓存键版本化"（如 `order:v2:1001`）是缓存与发布解耦的常用手法：新版本写新前缀，旧前缀靠 TTL 自然失效，无需批量删。
+
+#### ③ Redis · 基础读写与慢查询
+
+```bash
+redis-cli SET session:u1 "token-abc" EX 1800   # 写并设 30 分钟过期
+redis-cli GET session:u1                         # 读
+redis-cli SLOWLOG GET 10                         # 最近 10 条慢命令（时长/时间戳/命令）
+redis-cli SLOWLOG LEN                           # 当前慢日志条数
+redis-cli SLOWLOG RESET                         # 清空（排查前后对比用）
+redis-cli CONFIG GET slowlog-log-slower-than    # 慢阈值（微秒，默认 10000 = 10ms）
+```
+
+> **实战价值**：`SLOWLOG` 是定位"某个操作突然变慢"的第一手证据——看到大 key 的 `HGETALL`/`SMEMBERS` 或 `KEYS` 就能解释延迟毛刺。面试被问"Redis 偶尔卡一下怎么查"→ `SLOWLOG GET` + `INFO stats` 的 `latest_fork_usec`（持久化阻塞）。
+
+#### ④ Redis · 内存淘汰与配置热改
+
+```bash
+redis-cli CONFIG GET maxmemory             # 当前内存上限（0=不限制，危险）
+redis-cli CONFIG GET maxmemory-policy     # 淘汰策略：noeviction/allkeys-lru/volatile-lru/...
+redis-cli CONFIG SET maxmemory 4gb        # 热改上限（重启失效，需同步改配置文件）
+redis-cli CONFIG SET maxmemory-policy allkeys-lru   # 热改策略（立即生效，重启失效）
+redis-cli CONFIG REWRITE                  # 把当前 CONFIG SET 的结果写回配置文件（持久化热改）
+```
+
+> **实战价值**：`maxmemory-policy` 选错会误删数据——`volatile-lru` 只在带 TTL 的 key 里淘汰，没设过期的 key 永远不淘汰，内存打满后写请求直接报 `OOM command not allowed`；缓存场景一般用 `allkeys-lru`。面试要能说清各策略差异及"为什么缓存用 LRU 而不是 noeviction"。**`CONFIG SET` 只改运行时，一定记得 `CONFIG REWRITE` 或改配置文件，否则重启即丢。**
+
+#### ⑤ Redis · 持久化与危险命令（慎用）
+
+```bash
+redis-cli BGSAVE               # 后台落 RDB（不阻塞），看 INFO persistence 的 rdb_last_bgsave_status
+redis-cli BGREWRITEAOF         # 后台重写 AOF，压缩命令日志
+redis-cli LASTSAVE             # 上次 RDB 成功的时间戳
+redis-cli MONITOR              # ⚠️ 实时打印所有命令流，极其影响性能，仅临时抓现场，用完立刻 Ctrl-C
+```
+
+> **实战价值**：`BGSAVE`/`BGREWRITEAOF` 是"手动做一份检查点"的手段，配合备份演练（见 3.3）用；`MONITOR` 在高 QPS 实例上会让 Redis 额外开销飙升，**生产只在万不得已排障时开几秒**，这是面试体现"知道危险边界"的细节。
+
+#### ⑥ Redis · 命中率计算（面试高频）
+
+```bash
+redis-cli INFO stats | grep -E "keyspace_hits|keyspace_misses"
+# 命中率 = keyspace_hits / (keyspace_hits + keyspace_misses)
+# 例：hits=99000, misses=1000 → 命中率 = 99000/100000 = 99%
+```
+
+> **实战价值**：命中率掉通常意味着：① 缓存被大量淘汰（内存不够/策略错，回看 ④）；② 集中过期（TTL 设成同一时刻，回看 ②）；③ key 设计粒度太粗或雪崩。这是"缓存到底有没有用"的量化指标，面试官常让你现场算。
+
+#### ⑦ Redis · 主从 / 哨兵 / 集群状态核查
+
+```bash
+redis-cli INFO replication   # role:master/slave、connected_slaves、slaveN:...、master_repl_offset
+redis-cli ROLE               # 返回角色+复制偏移+从节点列表（更结构化）
+redis-cli INFO sentinel       # 哨兵模式下的哨兵状态（若以 sentinel 运行）
+redis-cli CLUSTER INFO        # 集群模式：cluster_state:ok / cluster_slots_assigned / cluster_known_nodes
+redis-cli CLUSTER NODES       # 每个节点的 id/role/槽位/连通状态
+```
+
+> **实战价值**：主从延迟看 `master_repl_offset` 与从节点 `slave_repl_offset` 的差值；集群 `cluster_state:fail` 说明有槽位不可用（部分 key 写不进去）。面试被问"主从切换后应用连不上"→ 检查客户端是否直连 Pod IP 而非走 Service/哨兵/集群代理（见第 6 节踩坑）。
+
+#### ⑧ PostgreSQL · 库表结构探查（psql 元命令）
+
+```bash
+psql -c "\l"                      # 列出所有数据库（含大小、owner）
+psql -c "\dn"                     # 列出 schema
+psql -c "\dt"                     # 当前库所有表
+psql -c "\d+ orders"              # 表的字段、类型、索引、约束、表大小（排表结构问题第一入口）
+psql -c "\d index_orders_user_id" # 看某个索引定义
+psql -c "\dv"                     # 视图列表
+```
+
+> **实战价值**：`\d+` 是"表为什么慢/为什么锁"的起点——一眼看到缺索引、看到行数估算（`reltuples`）、看到表膨胀（`\d+` 的 `Size` 与 `pgstattuple` 对比）。面试常从"这张表怎么排查"开场。
+
+#### ⑨ PostgreSQL · 执行计划（EXPLAIN ANALYZE）
+
+```bash
+psql -c "EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 123;"
+# 看：是否走索引（Index Scan vs Seq Scan）、actual rows vs estimated rows、是否 Sort/Hash 占大头
+psql -c "EXPLAIN (ANALYZE, BUFFERS) SELECT ..."   # 连缓冲命中一起看，定位是否读磁盘
+```
+
+> **实战价值**：`Seq Scan` 出现在大表上 = 缺索引或统计信息过期；`estimated rows` 与 `actual rows` 差几个数量级 = 该 `ANALYZE` 了（见 ⑫）。这是 SQL 性能排障的核心命令，面试必考。
+
+#### ⑩ PostgreSQL · 实时会话与锁（pg_stat_activity）
+
+```bash
+# 当前所有连接 + 正在执行的 SQL + 状态
+psql -c "SELECT pid, state, wait_event_type, query FROM pg_stat_activity WHERE state IS NOT NULL;"
+# 长事务（占用连接、可能挡 VACUUM）
+psql -c "SELECT pid, now()-xact_start AS dur, query FROM pg_stat_activity WHERE xact_start IS NOT NULL ORDER BY dur DESC;"
+# 锁等待链：谁被谁堵着
+psql -c "SELECT blocked.pid AS blocked_pid, blocking.pid AS blocking_pid, blocked.query
+FROM pg_locks bl JOIN pg_stat_activity blocked ON bl.pid=blocked.pid
+JOIN pg_locks kl ON bl.locktype=kl.locktype AND bl.obj=kl.obj AND bl.pid<>kl.pid
+JOIN pg_stat_activity blocking ON kl.pid=blocking.pid WHERE NOT bl.granted;"
+# 连接数水位
+psql -c "SELECT state, count(*) FROM pg_stat_activity GROUP BY state;"
+```
+
+> **实战价值**：`pg_stat_activity` 是 PG 排障的总入口——慢查询、长事务、连接打满（`max_connections` 耗尽）、锁等待都从这儿看。`state='idle in transaction'` 长时间存在 = 应用没提交事务，会挡 VACUUM 并占连接。面试被问"数据库突然慢/连不上"→ 先看 `pg_stat_activity`。
+
+#### ⑪ PostgreSQL · 慢查询源头（pg_stat_statements）
+
+```bash
+# 最耗时的 SQL Top10（需提前 CREATE EXTENSION pg_stat_statements; 并配 shared_preload_libraries）
+psql -c "SELECT query, calls, total_exec_time, mean_exec_time
+FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 10;"
+# 重置统计（对比优化前后）
+psql -c "SELECT pg_stat_statements_reset();"
+```
+
+> **实战价值**：`pg_stat_statements` 把"哪些 SQL 最费资源"量化出来，是做索引优化、SQL 改写前必须先拿的证据。面试答"怎么定位慢查询"→ `pg_stat_statements` 排 Top，再 `EXPLAIN ANALYZE` 看单条。
+
+#### ⑫ PostgreSQL · 清理与分析（VACUUM / ANALYZE）
+
+```bash
+psql -c "VACUUM (VERBOSE, ANALYZE) orders;"   # 回收死元组 + 更新统计信息
+psql -c "ANALYZE orders;"                      # 只更新统计信息（让 planner 选对执行计划）
+psql -c "VACUUM FULL orders;"                  # ⚠️ 锁表重写，仅维护窗口用，生产慎用
+# 看表膨胀情况
+psql -c "SELECT relname, n_dead_tup, n_live_tup FROM pg_stat_user_tables ORDER BY n_dead_tup DESC;"
+```
+
+> **实战价值**：MVCC 下 UPDATE/DELETE 产生死元组，`VACUUM` 不回收会被撑大、拖慢顺序扫描；统计信息过期会让 planner 选错计划（呼应 ⑨）。`autovacuum` 开着也要监控它有没有跟上写入。面试常问"表越来越大/查询变慢但数据没多"→ 死元组 + 未 ANALYZE。
+
+#### ⑬ PostgreSQL · 备份与恢复演练（pg_dump / pg_basebackup）
+
+```bash
+pg_dump -h <host> -U <user> -d appdb -F c -f appdb.dump    # 逻辑备份（自定义格式，可单表恢复）
+pg_dump -h <host> -U <user> -d appdb -t orders -f orders.sql   # 只备份单表
+pg_basebackup -h <primary> -D /backup/base -Ft -z -P          # 物理全量备份（PITR 基础）
+psql -c "\l"                       # 恢复前先确认目标库
+pg_restore -h <host> -U <user> -d appdb -t orders appdb.dump   # 从 dump 恢复单表
+```
+
+> **实战价值**：`pg_dump` 是逻辑备份（可跨版本、可单表），`pg_basebackup` 是物理备份（PITR 的基）——**备份不做恢复演练等于没备份**（呼应 3.3）。面试答"你们怎么备份 PG"→ 物理全量 + WAL 归档（见 ⑭）+ 定期恢复演练。
+
+#### ⑭ PostgreSQL · WAL 归档与流复制延迟（pg_stat_replication）
+
+```bash
+# 流复制从库延迟（主库上执行）
+psql -c "SELECT application_name, state,
+  pg_wal_lsn_diff(sent_lsn, replay_lsn) AS replay_lag_bytes,
+  write_lag, replay_lag FROM pg_stat_replication;"
+# WAL 归档是否跟上
+psql -c "SELECT * FROM pg_stat_archiver;"     # 看 archived_count / last_failed_time
+# 当前 WAL 写入位置
+psql -c "SELECT pg_current_wal_lsn();"
+```
+
+> **实战价值**：`pg_stat_replication` 的 `replay_lag` 是"从库落后主库多少"的量化指标——从库用来扛读流量时落后太多会读到旧数据。WAL 归档失败会让 PITR 链断，**归档必须监控**。这是主备架构面试的高频点。
+
+#### ⑮ PostgreSQL · 角色与权限（\du / GRANT）
+
+```bash
+psql -c "\du"                       # 列出角色与属性（超级用户/建库/建角色）
+psql -c "\dp"                       # 列出表级权限（谁对谁有什么权限）
+psql -c "GRANT SELECT ON orders TO app_ro;"     # 授权（最小权限原则）
+psql -c "REVOKE DELETE ON orders FROM app_rw;"   # 回收
+psql -c "SELECT rolname, rolcanlogin, rolsuper FROM pg_roles;"
+```
+
+> **实战价值**：应用账号应遵循最小权限——写库给 `INSERT/UPDATE/DELETE`、只读账号只 `SELECT`，禁止应用用超级用户。**连接串（含账号密码）走配置中心，不进镜像、不进 Git**（配置管理篇详述）。面试被问"数据库账号怎么管"→ 按应用分角色 + 最小权限 + 连接串入配置中心。
+
+#### ⑯ PostgreSQL · 连接池思路（PgBouncer）与 PITR 概念
+
+```bash
+# PgBouncer 不在数据库内，是独立连接池；常用运维是看/改其配置与状态
+psql -h 127.0.0.1 -p 6432 -U <user> -d pgbouncer -c "SHOW POOLS;"   # 看各库连接池占用
+psql -h 127.0.0.1 -p 6432 -U <user> -d pgbouncer -c "SHOW STATS;"   # 请求/命中统计
+# PITR（时间点恢复）概念命令：基于 basebackup + 连续 WAL 恢复到任一时间点
+#   pg_basebackup 做基 → archive_command 持续归档 WAL → 恢复时指定 target_time
+#   recovery_target_time = '2026-10-29 14:00:00'  （具体语法随版本，恢复前务必演练）
+```
+
+> **实战价值**：**连接池解决"应用短连接把 PG 的 `max_connections` 打满"**——PgBouncer 用 `transaction` 池模式把大量前端连接复用成少量后端连接，是 PG 高并发标配。PITR 是"误删/误改后能回到出事前一刻"的能力，建立在 ⑬ 物理备份 + ⑭ WAL 归档之上。**这两块（池配置、PITR 恢复演练）在配置管理与恢复演练篇细讲，本段只给命令与边界。**
+
+#### ⑰ 发布相关：缓存键版本化失效（命令级）
+
+```bash
+# 发布新版本时，旧版缓存前缀整体失效（不阻塞实例的安全删法）
+redis-cli --scan --pattern "order:v1:*" --count 500 | xargs -L 100 redis-cli DEL
+# 更稳妥：先确认数量再删
+redis-cli --scan --pattern "order:v1:*" --count 500 | wc -l
+# 连接串/迁移工具（Flyway/Liquibase）属于发布流水线，不在本段展开；
+# 其原则是 schema 迁移随发布走、连接串入配置中心——命令层你只需确认：
+psql -c "\dt"        # 发布后确认迁移生成的表/列已落地
+psql -c "SELECT version FROM flyway_schema_history ORDER BY installed_rank DESC LIMIT 5;"  # 若用 Flyway，查迁移版本
+```
+
+> **实战价值**：`--scan | xargs DEL` 是"按前缀批量失效"的标准安全写法（绝不用 `KEYS` 取全量再删）。版本化前缀（`order:v1`→`order:v2`）让新旧发布共存期间互不影响，回滚也只需切前缀。连接串与迁移编排在配置管理/CI 篇，本段不展开。
+
 ---
 
 ## 4. 逐字段表

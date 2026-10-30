@@ -1406,4 +1406,54 @@ kubectl run netcheck --rm -it --restart=Never --image=busybox:1.28 -- \
 
 ---
 
+## 9. 常用运维命令（存储 PV / PVC 排障速查）
+
+> **本节能做什么**：L6 讲 PV/PVC 绑定与制备，本节把**存储相关日常排障命令**按场景归类——PV/PVC 状态核查、PVC 在线扩容、挂载绑定关系、以及"PVC 一直 Pending"实战排障。**PVC 扩容前提是 StorageClass 开了 allowVolumeExpansion。**
+
+### ① PV / PVC 状态核查
+
+```bash
+kubectl get pv -A                                     # 看所有 PV 状态（Bound/Available/Released）
+kubectl get pvc -n prod -o wide                       # 看 PVC 状态/容量/绑定 PV/StorageClass
+kubectl describe pvc data -n prod                     # 看 Events / StorageClass / 容量请求
+kubectl describe pv pvc-xxxx                          # 看 claimRef / reclaimPolicy / 访问模式
+kubectl get storageclass                             # 看有哪些存储类、哪个是默认
+```
+
+> **实战价值**：PVC 状态是排障起点——`Pending` = 无匹配 StorageClass/容量/模式；`Bound` 后还报错多是挂载层；`Released` = Retain 策略残留，PV 不会被自动回收，要手动清 `claimRef` 才能复用。
+
+### ② PVC 在线扩容
+
+```bash
+kubectl get sc standard -o yaml | grep allowVolumeExpansion   # 确认允许扩容
+kubectl patch pvc data -n prod -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'
+kubectl get pvc data -n prod                     # CAPACITY 变成 20Gi（文件系统扩展由 CSI 完成）
+kubectl exec <pod> -n prod -- df -h /data        # 进容器确认文件系统已扩
+```
+
+> **实战价值**：**PVC 只能扩不能缩**（K8s 不支持缩容）；扩容能否成功完全取决于 StorageClass 的 `allowVolumeExpansion: true`，且最终要文件系统层（XFS/ext4）真正扩展，光改 PVC 不够。
+
+### ③ 挂载与绑定关系排障
+
+```bash
+kubectl get pods -n prod -o custom-columns='NAME:.metadata.name,VOLS:.spec.volumes[*].persistentVolumeClaim.claimName'
+kubectl describe pod <pod> -n prod               # 看 Mounts / 是否有 FailedMount / 等待卷
+kubectl get events -n prod --field-selector reason=FailedMount   # 集中看挂载失败事件
+```
+
+> **实战价值**：Pod 卡 `ContainerCreating` 多半是 Volume 挂载问题——FailedMount 常见原因：RWO 被多节点抢（Multi-Attach）、拓扑约束不满足、存储后端不可达。先看事件再定层。
+
+### ④ 排障实战：PVC 一直 Pending
+
+```bash
+kubectl describe pvc data -n prod        # Events：no matching volume / provisioning failed / access mode
+kubectl get storageclass                 # 引用的 StorageClass 存在吗？是默认吗？
+kubectl get pv                           # 现成 PV 的容量/模式/StorageClass 能否匹配
+# 现象：用了不存在的 StorageClass → 永远 Pending；RWO 被占用 → 需等释放或换节点
+```
+
+> **读法**：PVC Pending 看 `describe` 的 Events 三选一——(1) StorageClass 不存在/未默认；(2) 动态制备失败（后端配额/权限）；(3) 访问模式/容量与现成 PV 不匹配。别急着删 PVC，先读事件。
+
+---
+
 **下一篇**：[`L4-Service与网络`](L4-Service与网络.md)（回看 Service 与 Headless） · **上一篇**：[`L5-Ingress与配置管理`](L5-Ingress与配置管理.md) · **上一级**：[`00-学习地图与前置依赖`](../00-学习地图与前置依赖.md)

@@ -1283,4 +1283,70 @@ NetworkPolicy（内层）：控制"集群内哪个 Pod 能和哪个 Pod 通信"
 
 ---
 
+## 9. 常用运维命令（安全 / RBAC 排障速查）
+
+> **本节能做什么**：L9 讲认证、RBAC 与合规基线，本节把**安全相关日常核查命令**按场景归类——`auth can-i` 权限自查、ServiceAccount/Secret/Token 核查、RoleBinding 反查、以及 kube-bench 合规思路。**面试高频："这个 ServiceAccount 到底有什么权限？"靠 `auth can-i --as` 一口答出。**
+
+### ① 身份与权限核查（auth can-i）
+
+```bash
+kubectl auth can-i get pods -n prod                      # 我有没有这个权限
+kubectl auth can-i delete deployments -n prod --as=system:serviceaccount:prod:ci-bot   # 模拟别人身份核查
+kubectl auth can-i --list --as=system:serviceaccount:prod:ci-bot                       # 列出该身份全部权限
+kubectl auth whoami                                      # 看当前操作的身份（部分版本支持）
+kubectl config current-context                           # 确认自己现在以哪个 context/身份在操作
+```
+
+> **实战价值**：把"没权限（403 Forbidden）"和"资源不存在（404）"一眼分开；`--as` 能模拟任意 ServiceAccount 核查权限，是排查"CI 账号为什么不能部署"的利器。
+
+### ② ServiceAccount 与 Secret / Token 核查
+
+```bash
+kubectl get sa -n prod                                  # 列命名空间内的 ServiceAccount
+kubectl get secret -n prod                              # 列 Secret（含 SA 的 token 类）
+kubectl get sa ci-bot -n prod -o yaml                   # 看 secrets / imagePullSecrets 绑定
+kubectl get secret ci-bot-token-xxxx -n prod -o jsonpath='{.data.token}' | base64 -d   # 解出 token（仅排障用）
+kubectl describe secret ci-bot-token-xxxx -n prod       # 看类型/过期（投射卷 token 自动轮转）
+```
+
+> **实战价值**：SA 的 token 是**短期的**（投射卷自动轮转），不是永久凭据；Secret 的 `data` 字段是 base64，**不是加密**——敏感信息进 etcd 需开静态加密，别把 Secret 当保险箱。
+
+### ③ RBAC 对象与绑定反查
+
+```bash
+kubectl get role,rolebinding -n prod                    # 命名空间级 RBAC 对象
+kubectl get clusterrole,clusterrolebinding              # 集群级 RBAC 对象
+kubectl describe rolebinding prod-dev -n prod           # 看 roleRef / subjects（谁被绑定了）
+kubectl get rolebinding prod-dev -n prod -o yaml        # 看完整绑定关系
+kubectl auth can-i get secrets -n prod --as=system:serviceaccount:prod:prod-sa   # 验证某 SA 实际能力
+```
+
+> **实战价值**：权限问题先看 RoleBinding 的 `subjects`（谁）和 `roleRef`（给了什么 Role）；`roleRef` 写错直接报 validation error；用 `auth can-i --as` 反向验证"这个绑定到底生效没有"。
+
+### ④ 合规与基线检查（kube-bench 思路）
+
+```bash
+# kube-bench 跑 CIS Kubernetes Benchmark（以 Job 方式在节点上跑，需对应权限）
+kubectl apply -f https://raw.githubusercontent.com/aquasecurity/kube-bench/main/job.yaml
+kubectl logs job/kube-bench                 # 看 [FAIL] 项（匿名访问、kubelet 只读端口、特权容器等）
+# 核查 Pod Security Admission 基线标签
+kubectl get ns prod -o jsonpath='{.metadata.labels}'     # pod-security.kubernetes.io/enforce 取值
+kubectl get pods -n prod -o custom-columns='NAME:.metadata.name,SA:.spec.serviceAccountName'
+```
+
+> **实战价值**：**kube-bench（CIS 基线）是面试加分项**——能说出"怎么验证集群是否符合安全基线"。PSA 的 `enforce=restricted` 是默认安全基线，标签设在命名空间上，违规 Pod 会被准入拒绝（注意它只拦"最终 Pod"，不拦 apply）。
+
+### ⑤ 排障实战：apply 报错 403 Forbidden
+
+```bash
+kubectl auth can-i create deployment -n prod                  # 当前身份有没有这个权限？
+kubectl auth can-i create deployment -n prod --as=system:serviceaccount:prod:default   # 模拟 SA
+kubectl describe rolebinding <binding> -n prod                # 对应绑定是否存在 / subjects 对不对
+# 现象：can-i 返回 no → 缺 RoleBinding；返回 yes 但还 403 → 可能是集群级资源需 ClusterRole
+```
+
+> **读法**：403 不要急着加权限。先用 `auth can-i` 确认"这个身份到底有没有"，再看 RoleBinding 的 subjects 是否包含了它、roleRef 是否指向了正确的 Role——很多 403 是"绑错了人"而非"权限不够"。
+
+---
+
 **上一篇**：[`L8-弹性HPA.md`](L8-弹性HPA.md) · **下一篇**：[`L10-排障方法论.md`](L10-排障方法论.md) · **上一级**：[`../00-学习地图与前置依赖.md`](../00-学习地图与前置依赖.md) · **相关**：[`../01-基础篇/L3-镜像仓库与供应链安全.md`](../01-基础篇/L3-镜像仓库与供应链安全.md)（镜像供应链）

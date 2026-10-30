@@ -902,6 +902,97 @@ grep -n 'image:.*:latest' rendered.yaml && exit 1
 
 ---
 
+### 3.4 常用运维命令（Helm 包管理，按场景）
+
+> **本节能做什么**：3.1–3.3 是"怎么把 Chart 写对"，本节是**每天值班 / 面试都会敲的 Helm 运维命令**——从加仓库、装包、升级、回滚到本地验 YAML，一条龙。Helm 是 GitOps 交付链里"打包"那一环，这些命令是配置管理岗的高频肌肉记忆。
+> **环境基准**：本机实测 `helm v3.14.x`。所有命令默认作用于当前 kube-context。
+
+#### ① 仓库管理（repo add / update / search）
+
+```bash
+helm repo add bitnami https://charts.bitnami.com/bitnami   # 加一个公共仓库
+helm repo update                                           # 拉取所有仓库的最新索引（装包前必跑）
+helm repo list                                             # 看已配置的仓库
+helm search repo nginx                                     # 在已加仓库里搜 chart
+helm search hub nginx                                      # 到 Artifact Hub 公共仓搜
+```
+
+> **实战价值**：`helm repo update` 忘了跑，装到的会是**上个月的旧版本**——这是新手最常见的"为什么装出来的镜像不对"。CI 里每次 `helm install` 前都应先 `repo update`。
+
+#### ② Chart 脚手架与依赖（create / dependency build / update / pull）
+
+```bash
+helm create mychart                         # 生成一个标准骨架（templates/ + values.yaml）
+helm dependency build                       # 按 Chart.yaml 的 dependencies 拉子 chart 到 charts/ 并打 tgz
+helm dependency update                      # 同 build，但会更新 Chart.lock 里的版本
+helm dependency list                        # 看当前 chart 依赖了哪些子 chart
+helm pull bitnami/nginx --untar             # 把别人的 chart 拉下来本地改（学习/二次封装常用）
+```
+
+> **实战价值**：`dependency build` 失败通常卡在**网络或 repo 没 add**；多 chart 复用（umbrella chart）时，`dependency update` 能保证团队拿到锁定的子版本，避免"我本地好使"的玄学问题。
+
+#### ③ 安装与升级（install / upgrade，--set / --values / --namespace）
+
+```bash
+helm install myrel bitnami/nginx -n demo --create-namespace          # 装一个 release（首次用 install）
+helm install myrel ./mychart -f values-prod.yaml --set replicaCount=3 # 用文件 + 命令行覆盖值
+helm upgrade myrel bitnami/nginx -n demo --reuse-values --set image.tag=v2  # 升级并保留旧值
+helm upgrade myrel ./mychart -n demo --reset-values -f values.yaml    # 升级并丢弃旧值，完全用新文件
+helm upgrade myrel ./mychart -n demo --atomic                        # 升级失败自动回滚（救火开关）
+helm upgrade myrel ./mychart -n demo --dry-run                       # 只算不发，先验证会改什么
+```
+
+> **实战价值**：`--reuse-values` 是日常小改（只换镜像 tag）的省事开关；`--reset-values` 适合"我就要这份 values 说了算"的场景。`--atomic` 把"升级翻车"变成自动回滚，生产发布强烈建议带上。
+
+#### ④ 渲染预览与校验（template / lint）—— 本地验 YAML，提早发现错误
+
+```bash
+helm template myrel ./mychart -f values-prod.yaml          # 把最终要提交的 YAML 渲染出来看（不动集群）
+helm template myrel ./mychart --set image.tag=v2 | kubectl diff -f -   # 配合 kubectl diff 看会改什么
+helm lint ./mychart                                       # 静态检查 Chart 结构与模板语法
+helm lint ./mychart --strict                               # 严格模式，warning 也当 error
+```
+
+> **实战价值**：**`helm template` 是面试和实战的杀手锏**——改完 Chart 不急着 `upgrade`，先 `template` 把 YAML 打出来肉眼审一遍（镜像 tag 对不对、resources 有没有、selector 稳不稳定）。`lint` 能在 CI 里挡住 80% 的模板低级错误，比等到 `upgrade` 才红便宜得多。
+
+#### ⑤ 发布生命周期管理（status / list / history / rollback / uninstall）
+
+```bash
+helm list -n demo -a                              # 看某 ns 的 release（-a 含已卸载的）
+helm status myrel -n demo                         # 看这个 release 的状态/资源/notes
+helm history myrel -n demo                        # 看每次升级的 revision 记录
+helm rollback myrel 2 -n demo                      # 回滚到第 2 个 revision（救火第一招）
+helm rollback myrel 0 -n demo                      # 回滚到上一版（revision 0 即上一版）
+helm uninstall myrel -n demo                       # 卸载（默认保留 history，可 --keep-history 显式保留）
+```
+
+> **实战价值**：发布翻车第一反应不是改 yaml 重发，而是 `helm rollback` 先恢复服务，再慢慢查。`history` + `rollback` 是 Helm 相较裸 kubectl apply 最大的优势——**每次变更都有版本号可追溯**。
+
+#### ⑥ 查看已发布内容（get values / manifests / notes）
+
+```bash
+helm get values myrel -n demo                     # 看这个 release 实际生效的 values（排查"配了没生效"）
+helm get values myrel -n demo --revision 3        # 看某一历史版本的 values
+helm get manifests myrel -n demo                  # 看这个 release 渲染出的全部资源 YAML
+helm get notes myrel -n demo                      # 看 Chart 作者写的部署后指引（账号/端口等）
+```
+
+> **实战价值**：`get values` 是排查"我明明改了为什么没变"的终极手段——它显示的是**真正下发给集群的值**，能一眼看出 `--set` 被 `--values` 盖掉、或 `--reuse-values` 没带上预期改动。
+
+#### ⑦ 打包、校验与发布（package / verify / env）
+
+```bash
+helm package ./mychart                           # 打成 mychart-0.1.0.tgz，准备发到仓库
+helm package ./mychart --sign --key 'mykey'      # 打包并加签名（供应链安全）
+helm verify mychart-0.1.0.tgz                    # 校验签名完整性（配合 --sign 用）
+helm pull bitnami/nginx --version 15.0.0         # 按版本拉取指定 chart
+helm env                                         # 看 Helm 的家目录 / 缓存 / 插件路径等环境信息
+```
+
+> **实战价值**：`package` + 推到内部 chartmuseum/harbor 是团队复用 Chart 的闭环；`--sign` / `verify` 在金融、政企等对供应链安全有要求的岗位是加分项，面试常问"怎么保证 chart 没被篡改"。
+
+---
+
 ## 4. 逐字段表
 
 ### 4.1 `Chart.yaml` 逐字段

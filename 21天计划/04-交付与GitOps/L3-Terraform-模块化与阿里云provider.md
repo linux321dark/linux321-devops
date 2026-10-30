@@ -1160,6 +1160,61 @@ terraform plan
 
 ---
 
+### 3.5 常用运维命令（Terraform 模块与多环境，按场景）
+
+> **本节能做什么**：3.1–3.4 是"把模块写出来、把存量资源纳管进来"，本节是**团队用模块 + 多环境时每天会敲的 Terraform 运维命令**——模块升级、按环境套值、状态搬迁、provider 锁定。配置管理岗做"基础设施即代码平台化"就靠这些。
+> **环境基准**：本机实测 `terraform v1.9.x`，以 `alicloud` provider + 自研 module 为例。
+
+#### ① 模块拉取与升级（init / get / providers lock）
+
+```bash
+terraform init                                  # 初始化并拉取 module 源（首次/改 source 后必跑）
+terraform init -upgrade                         # 把 module 和 provider 升到版本约束允许的最新（升级依赖用）
+terraform get -update                           # 只更新 module 缓存（不碰 provider/backend）
+terraform providers lock -platform=linux_amd64 -platform=darwin_arm64  # 锁定多平台 provider 校验和
+terraform providers schema -json                # 导出 provider 的 schema（给工具链/文档用）
+```
+
+> **实战价值**：`init -upgrade` 是"模块出新版本了，我要跟"的标准动作；但**生产前务必先 `plan` 看 diff**，模块升级经常偷偷改默认值。`providers lock` 在多架构 CI（mac 开发、linux 跑流水线）时是必需的，否则流水线报"checksum 不匹配"。
+
+#### ② 多环境套值与定向执行（plan/apply -var-file / -target）
+
+```bash
+terraform plan -var-file=env/prod.tfvars        # 用 prod 环境变量文件跑 plan
+terraform apply -var-file=env/staging.tfvars -auto-approve
+terraform plan -var="instance_count=3"          # 命令行临时覆盖单个变量
+terraform apply -target=module.net.vpc         # 只动某个 module 的资源（紧急修网用，慎用）
+terraform plan -var-file=env/prod.tfvars -out=prod.tfplan  # 存 plan，apply 时吃同一份
+```
+
+> **实战价值**：`-var-file` 是"一套 module、N 套环境"的核心开关，环境差异全在 tfvars 里。`-target` 能救急（只修一个挂了的资源），但**长期用会破坏 state 一致性**，只当作临时手术刀。
+
+#### ③ 状态与资源重构（state mv / rm / push / pull）
+
+```bash
+terraform state list                            # 看当前有哪些资源
+terraform state mv module.old.vpc module.new.vpc  # 模块重构后搬 state，避免销毁重建
+terraform state rm module.legacy.thing         # 把资源移出 state（保留云上真实资源）
+terraform state push                            # 把本地 state 推回 remote backend
+terraform state pull > local.tfstate            # 把 remote state 拉到本地备份/审计
+terraform output -json                          # 导出全部 output 为 JSON（对接其他系统/CI）
+```
+
+> **实战价值**：**`state mv` 是模块重构的护身符**——你重命名了 module 路径，不 mv 就会"旧资源被销毁 + 新资源被创建"，生产上就是一次事故。`state pull` 定期备份 remote state 到 Git，是防御 backend 损坏的最后一道保险。
+
+#### ④ 排障：模块校验与漂移
+
+```bash
+terraform validate -json                       # 机器可读的校验结果（CI 里当门禁）
+terraform fmt -check -recursive                # 只检查格式不改动，CI 门禁用（不合规就红）
+terraform plan -detailed-exitcode              # 0=无变更 1=错误 2=有变更
+terraform refresh && terraform plan            # 漂移复原计划：先对齐真实云上再判断
+```
+
+> **实战价值**：`fmt -check` + `validate -json` 放进 PR 流水线，能在合入前挡住 90% 的模块低级错误。`-detailed-exitcode` 让 CI 精确区分"没变化（跳过 apply）"和"有漂移（要同步）"，是 GitOps 自动化的关键判断位。
+
+---
+
 ## 4. 逐字段表
 
 ### 4.1 provider 配置项表（alicloud）

@@ -48,7 +48,9 @@ L2 PromQL 实战
 ├─ 3. 动手
 │   ├─ 3.1 表达式浏览器的基本操作
 │   ├─ 3.2 用 6 个排障查询走一遍
-│   └─ 3.3 验证清单
+│   ├─ 3.3 验证清单
+│   ├─ 3.4 常用运维命令（按场景）
+│   └─ 3.5 运维排障实战（场景串命令）
 │
 ├─ 4. 逐字段表
 │   ├─ 4.1 函数表（函数 | 类型 | 语义 | 典型用途 | 陷阱）
@@ -1708,6 +1710,114 @@ predict_linear(container_memory_working_set_bytes{namespace="demo"}[6h], 4*3600)
 | **直方图分位数都带 `le`** | 检查所有 `histogram_quantile` | 前一层一定有 `sum by (le, ...)` |
 | **告警都有 `for`** | 检查所有 alerting rule | 除"实例彻底不可用"外都有 `for` |
 | **规则语法正确** | `promtool check rules <file>` | 退出码 0 |
+
+---
+
+### 3.4 常用运维命令（按场景）
+
+> **本节能做什么**：3.2 是"在浏览器里写查询"，本节是**不用 UI、纯命令行就能把 PromQL 跑起来、验规则、查元数据的运维命令**——值班和面试都考。**PromQL 排障的肌肉记忆就来自这一张表。**
+
+### ① 用 API 跑 PromQL（命令行版表达式浏览器）
+
+```bash
+curl -s 'http://localhost:9090/api/v1/query?query=up'                                  # 瞬时查询
+curl -s 'http://localhost:9090/api/v1/query_range?query=rate(http_requests_total[5m])&start=1700000000&end=1700003600&step=60'  # 区间查询
+curl -s 'http://localhost:9090/api/v1/query?query=topk(5,rate(http_requests_total[5m]))' # 直接验证聚合/排序
+```
+
+> **实战价值**：`/api/v1/query` 和 `/query_range` 就是表达式浏览器的底层接口，**面试被问"不打开 UI 怎么验证一条 PromQL"就答这两个**。把复杂查询先在命令行跑通，再贴进看板，能少走很多弯路。
+
+### ② 规则语法与单元测试（改完规则先过这一关）
+
+```bash
+promtool check rules /etc/prometheus/rules/*.yml        # 校验告警/记录规则语法（rate 窗口、for、labels）
+promtool test rules /etc/prometheus/rules/tests/*.yml   # 用样本数据跑规则单元测试（CI 里必接）
+promtool check config /etc/prometheus/prometheus.yml    # 顺带确认主配置也 OK
+```
+
+> **实战价值**：`promtool check rules` 能在提交前挡掉 `for` 写错、`rate` 窗口过短这类低级错误；`promtool test rules` 用历史样本验证"这条告警在事故当天会不会触发"——**这是把告警质量纳入 CI 的标准做法，面试高频考点**。
+
+### ③ 即时元数据查询（排"查不到"的归属）
+
+```bash
+curl -s 'http://localhost:9090/api/v1/labels' | head -c 400                 # 看有哪些标签键
+curl -s 'http://localhost:9090/api/v1/label/__name__/values' | head -c 400  # 看有哪些指标名（高基数排查入口）
+curl -s 'http://localhost:9090/api/v1/series?match[]=up' | head -c 400       # 看某个 selector 命中的真实序列
+curl -s 'http://localhost:9090/api/v1/query?query=count by (__name__)({__name__=~"http.+"})'  # 维度数
+```
+
+> **实战价值**：查询返回空，**先别改查询**——用 `/api/v1/series` 确认 selector 到底命没命中序列，用 `/label/__name__/values` 看指标名是不是拼错（大小写、复数）。空结果 90% 是"标签值/指标名写错"，不是 PromQL 写错。
+
+### ④ 高基数与性能排查（查询慢的真凶）
+
+```bash
+curl -s 'http://localhost:9090/api/v1/label/__name__/values' | tr ',' '\n' | wc -l   # 指标名总数
+promtool tsdb analyze /var/lib/prometheus/data 2>/dev/null | grep -iE 'top|cardinality' | head  # 找高基数指标
+curl -s 'http://localhost:9090/api/v1/query?query=count by (__name__)({__name__!=""})'          # 全量 series 数
+```
+
+> **实战价值**：看板卡、查询超时，多半是某条查询扫了海量 series。**先定位高基数指标名**，再回到查询里加更精确的标签过滤或改用 `recording rules` 预计算（§2.10）——这也是面试"PromQL 怎么优化"的标准答法。
+
+### ⑤ 告警 / 记录规则生效验证
+
+```bash
+curl -s 'http://localhost:9090/api/v1/rules' | head -c 600          # 看当前加载的规则、状态、上一次求值
+curl -s 'http://localhost:9090/api/v1/alerts' | head -c 600        # 看当前 active 的告警（pending/firing）
+curl -s 'http://localhost:9090/api/v1/query?query=ALERTS'          # 用 ALERTS 指标查历史告警状态
+```
+
+> **实战价值**：规则写进文件不等于生效——`/api/v1/rules` 看"加载了没、上次求值报错没"，`/api/v1/alerts` 看"到底 firing 了没"。**告警没来，先查 rules 的 `lastEvaluation` 和 `evaluationErrors`，别盯看板。**
+
+### ⑥ 通用：端口、进程、配置校验
+
+```bash
+ss -ltnp | grep 9090                       # 端口
+ps aux | grep prometheus | grep -v grep     # 进程与启动参数（--config.file、--web.enable-lifecycle）
+promtool check config /etc/prometheus/prometheus.yml   # 任何改动前的第一道闸
+```
+
+> **实战价值**：`promtool check config` 是 Prometheus 运维的"安全带"，**改任何东西之前先跑它**，比 reload 后救火便宜得多。
+
+---
+
+### 3.5 运维排障实战（场景串命令）
+
+> **把 3.4 的命令用起来**：三个最典型的 PromQL 故障，按"现象 → 敲的命令 → 怎么读"走一遍。**建议在表达式浏览器 + 命令行对照练，建立"同一个查询两种入口"的手感。**
+
+### 场景 A：查询返回空结果（怀疑 PromQL 写错）
+
+```bash
+curl -s 'http://localhost:9090/api/v1/query?query=http_requests_total'     # 先裸查指标名
+curl -s 'http://localhost:9090/api/v1/series?match[]=http_requests_total'  # 看命中的真实标签集
+curl -s 'http://localhost:9090/api/v1/label/__name__/values' | grep -i http # 确认指标名拼对了
+# 典型：写成 http_request_total（少 s）→ 空；或标签值写 'GET' 实际是 'get'
+```
+
+> **读法**：空结果**先查 selector 命没命中**，不是急着改函数。用 `/series` 看真实标签，`/label/__name__/values` 看指标名拼写。**PromQL 不报错，它给你空——这是它最坑的地方（§1.4），必须用 API 把"到底有没有这个序列"坐实。**
+
+### 场景 B：rate 算出来是 0 或结果明显不对
+
+```bash
+curl -s 'http://localhost:9090/api/v1/query?query=rate(http_requests_total[1m])'   # 窗口太短
+curl -s 'http://localhost:9090/api/v1/query?query=rate(http_requests_total[5m])'   # 加长到 4 个样本以上
+curl -s 'http://localhost:9090/api/v1/query?query=increase(http_requests_total[5m])' # 对比 increase
+# 典型：窗口 1m 但 scrape_interval 30s → 只有 2 个样本，rate 不稳；counter 刚重置导致断崖
+```
+
+> **读法**：`rate` 窗口至少要覆盖 **4 个 scrape 间隔**（§2.4.2）。窗口太短→样本不足→结果抖动或归零；counter 发生重置→`rate` 会自动处理（§2.4.3），但若用 `irate` 在重置边界会跳。**先加长窗口再下结论。**
+
+### 场景 C：告警规则写好了，但事故当天没 firing
+
+```bash
+curl -s 'http://localhost:9090/api/v1/rules' | python3 -m json.tool | grep -A6 '"name":"HighErrorRate"'  # 看规则状态
+curl -s 'http://localhost:9090/api/v1/alerts'                                                       # 看 active 告警
+curl -s 'http://localhost:9090/api/v1/query?query=rate(http_errors_total[5m]) / rate(http_requests_total[5m]) > 0.05'  # 手动复算条件
+# 典型：for: 10m 但事故只持续 3 分钟 → 永远 pending；或分子分母 sum by 维度不一致
+```
+
+> **读法**：告警不 firing，先 `/rules` 看 `evaluationErrors`（表达式本身报错）和 `lastEvaluation`（有没有在求值）；再手动跑条件确认"事故窗口里到底满不满足"。**`for` 设太长 + 故障太短 = 永远 pending**，这是实战最常见的"漏报"原因（对照 §2.11）。
+
+> **三个场景的共同心法**：**先用 API 把"有没有这个序列 / 条件到底满不满足"坐实，再谈改查询**。PromQL 的坑不是语法报错，是"安静地给你错的数"——命令行 + 手动复算是最好的照妖镜。
 
 ---
 

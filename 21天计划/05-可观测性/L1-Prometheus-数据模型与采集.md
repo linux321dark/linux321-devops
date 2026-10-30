@@ -39,7 +39,10 @@ L1 Prometheus 数据模型与采集
 ├─ 3. 动手
 │   ├─ 3.1 最小可运行配置：先抓自己
 │   ├─ 3.2 加一个静态目标 + 验证 up
-│   └─ 3.3 K8s 场景：kubernetes_sd 抓 Pod（每步写清"看到什么算对"）
+│   ├─ 3.3 K8s 场景：kubernetes_sd 抓 Pod（每步写清"看到什么算对"）
+│   ├─ 3.4 验证清单（收口）
+│   ├─ 3.5 常用运维命令（按场景）
+│   └─ 3.6 运维排障实战（场景串命令）
 │
 ├─ 4. 逐字段表
 │   ├─ 4.1 scrape_config 关键字段表
@@ -1266,6 +1269,121 @@ scrape_configs:
 | 没有高基数元凶 | `count by (__name__) ({__name__!=""})` | 集中在少数几个指标名上，无数量级跳变 |
 | 标签维度干净 | 挑一个指标看标签列表 | **没有** `user_id` / `request_id` / 完整 URL |
 | 服务发现生效 | Pod 扩缩容后看 `/targets` | 目标数跟着变 |
+
+---
+
+### 3.5 常用运维命令（按场景）
+
+> **本节能做什么**：3.1–3.4 是"把采集跑起来"，本节是**每天值班 / 面试都会被问到的 Prometheus 运维命令**——按场景归类，每条配真实例子。**Prometheus 排障的肌肉记忆就来自这一张表。**
+
+### ① 配置与规则语法校验（改完先过这一关，别直接 reload）
+
+```bash
+promtool check config /etc/prometheus/prometheus.yml          # 校验主配置（含 scrape 语法、relabel 写法）
+promtool check rules /etc/prometheus/rules/*.yml              # 校验告警/记录规则（rate 窗口、for 语法）
+promtool query instant http://localhost:9090 'up'            # 顺手验一下引擎能不能算
+```
+
+> **实战价值**：`promtool check config` 能在 reload 前挡掉 90% 的"改坏"——**很多生产事故是先改了 prometheus.yml 再 reload，结果整个实例起不来**。面试官常问"你怎么做配置变更管控"，高分答法是"所有改动走 Git + `promtool check config` 校验 + 灰度 reload"。
+
+### ② 用 API 验端点与查数据（PromQL 实战的命令行版）
+
+```bash
+curl -s 'http://localhost:9090/api/v1/query?query=up'                                   # 直接打查询 API，返回 JSON
+curl -s 'http://localhost:9090/api/v1/query?query=rate(http_requests_total[5m])'        # 跟表达式浏览器同一套引擎
+curl -s 'http://localhost:9090/-/ready'                                                  # 健康探针（k8s readiness 用它）
+curl -s 'http://localhost:9090/-/healthy'
+curl -s 'http://localhost:9090/api/v1/status/config' | head -c 300                      # 看当前生效配置（确认 reload 成功）
+curl -s 'http://localhost:9090/api/v1/status/flags'   | head -c 300                      # 看启动参数
+```
+
+> **实战价值**：`/api/v1/query` 是表达式浏览器的底层接口，**面试让你"不用 UI 怎么查 PromQL"就靠它**；`/status/config` 能确认"我改的配置到底 reload 进去没有"——改了不生效时第一反应看这里。
+
+### ③ 抓取目标排障（up 指标是最该盯的仪表盘）
+
+```bash
+curl -s 'http://localhost:9090/api/v1/query?query=up'                 # up==0 的 target 就是没抓到
+curl -s 'http://localhost:9090/api/v1/targets' | head -c 800         # 看每个 target 的 lastError / lastScrape
+kubectl -n monitoring get endpoints prometheus-operators-kubelet      # 配合 kubernetes_sd 时验 endpoint 在不在
+# file_sd 热加载：改了 json 文件，Prometheus 自动重读，不用 reload
+curl -s 'http://localhost:9090/api/v1/targets?state=active' | grep -o '"health":"[a-z]*"' | sort | uniq -c
+```
+
+> **实战价值**：`up{job="x"} == 0` 是抓取失败的总开关；`/api/v1/targets` 里的 `lastError` 直接告诉你"连不上 / 超时 / 401 / 证书错"。**别猜，看 lastError。** 这是 §2.5 scrape 生命周期出问题时唯一的真相入口。
+
+### ④ TSDB 与存储状态（内存打满、磁盘爆的源头）
+
+```bash
+curl -s 'http://localhost:9090/api/v1/status/tsdb' | head -c 600   # 看 headSeries / chunkCount / 内存占用
+promtool tsdb list /var/lib/prometheus/data                        # 看 block 列表、时间范围、样本数
+promtool tsdb analyze /var/lib/prometheus/data                     # 分析高基数指标（面试加分项）
+du -sh /var/lib/prometheus/*                                       # 磁盘占用（retention 没生效会爆盘）
+ls /var/lib/prometheus/wal                                         # WAL 目录（崩溃恢复靠它）
+```
+
+> **实战价值**：`status/tsdb` 的 `headSeries` 直接反映内存压力——**标签基数爆炸时 headSeries 会疯涨，OOM 前先看这个数**；`promtool tsdb analyze` 是定位"哪个指标名 cardinality 最大"的官方工具，面试被问"怎么排查 Prometheus 内存高"必答这一条。
+
+### ⑤ exporter 与黑盒探测（指标抓取失败排查）
+
+```bash
+curl -s http://localhost:9100/metrics | grep -E '^node_cpu|^node_memory' | head   # 直连 node_exporter 验它自己有没有数据
+curl -s http://localhost:9100/metrics | wc -l                                     # 抓不到时先确认 exporter 在不在
+curl -s 'http://localhost:9115/probe?target=https://example.com&module=http_2xx'  # 黑盒探测：直接打 probe 接口看结果
+curl -s 'http://localhost:9090/api/v1/query?query=probe_success'                 # blackbox 的探测成败指标
+```
+
+> **实战价值**：exporter 挂了，Prometheus 那头只会看到 `up==0`，**真因要去 exporter 自己的 `/metrics` 看**；黑盒探测失败优先用 `probe_success` 和 `probe_*` 指标定位是 DNS / TLS / 超时哪一段。
+
+### ⑥ 通用：进程、端口、重载
+
+```bash
+ps aux | grep prometheus | grep -v grep          # 确认进程在、看启动参数（--config.file / --storage.tsdb.retention）
+ss -ltnp | grep 9090                              # 端口在不在
+curl -X POST http://localhost:9090/-/reload      # 改完配置热加载（需启动时开 --web.enable-lifecycle）
+kill -HUP $(pidof prometheus)                    # 等价 reload 的另一条路
+```
+
+> **实战价值**：`/-/reload` 是改配置后不重启实例的唯一安全路径；但**必须启动时带 `--web.enable-lifecycle`**，否则 404——很多人第一次 reload 就卡在这。
+
+---
+
+### 3.6 运维排障实战（场景串命令）
+
+> **把 3.5 的命令用起来**：三个最典型的 Prometheus 故障，按"现象 → 敲的命令 → 怎么读"走一遍。**都建议在有 Prometheus 的 kind / 测试环境练，别在真集群试。**
+
+### 场景 A：某个 target 的 up 一直是 0（抓取失败）
+
+```bash
+curl -s 'http://localhost:9090/api/v1/query?query=up{job="myjob"}'   # 现象：value 是 0
+curl -s 'http://localhost:9090/api/v1/targets' | python3 -m json.tool | grep -A3 '"scrapePool":"myjob"'  # 看 lastError
+# 典型 lastError：context deadline exceeded（超时）/ connection refused（exporter 没起）/ 401（需 bearer token）
+```
+
+> **读法**：`up==0` 只说明"没抓到"，**真因在 `/targets` 的 `lastError`**。超时先查网络/端口，401 查 `authorization` 配置，证书错查 `tls_config`。**别改 Prometheus 配置去猜，先看 lastError。**
+
+### 场景 B：Prometheus 内存持续涨、最后 OOM（标签基数爆炸）
+
+```bash
+curl -s 'http://localhost:9090/api/v1/status/tsdb' | grep -o '"headSeries":[0-9]*'   # 看 series 数
+promtool tsdb analyze /var/lib/prometheus/data 2>/dev/null | grep -E 'Series|Label' | head   # 找罪魁指标
+curl -s 'http://localhost:9090/api/v1/query?query=count by (__name__)({__name__=~".+"})'  # 全量 series 数
+```
+
+> **读法**：`headSeries` 涨得离谱（百万级还往上）基本就是高基数——回到 §2.2，问题八成在 `user_id`/`request_id`/`url` 这类无界标签；`promtool tsdb analyze` 会直接列出 top 高基数指标名，回去加 `metric_relabel_configs` 的 `drop` 动作（§2.7 / 2.8）。
+
+### 场景 C：改了 prometheus.yml 但配置不生效 / reload 报错
+
+```bash
+promtool check config /etc/prometheus/prometheus.yml    # 先本地校验，把语法错挡在 reload 之前
+curl -X POST http://localhost:9090/-/reload             # 校验过了再 reload
+curl -s 'http://localhost:9090/api/v1/status/config' | head -c 300   # 看生效的配置是不是新内容
+# 若 reload 返回 404：说明启动时没开 --web.enable-lifecycle
+ps aux | grep prometheus | grep -- '--web.enable-lifecycle'   # 确认这个参数在不在
+```
+
+> **读法**：改了不生效，先 `promtool check config` 确认语法没问题，再 `reload`，最后用 `/status/config` 比对"线上跑的"和"你以为改的"是不是一份。**reload 404 一定是缺 `--web.enable-lifecycle`**，不是配置问题。
+
+> **三个场景的共同心法**：**先看状态（up / headSeries / config）→ 再看错误（lastError / analyze / status）→ 最后才是改**。90% 的 Prometheus 排障卡在"没看 targets 的 lastError 就乱改 relabel"。
 
 ---
 

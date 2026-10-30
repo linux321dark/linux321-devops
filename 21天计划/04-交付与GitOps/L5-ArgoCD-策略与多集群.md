@@ -780,6 +780,65 @@ spec:
 
 ---
 
+### 3.6 常用运维命令（Argo CD 多集群 / 策略 / 排障，按场景）
+
+> **本节能做什么**：3.1–3.5 是"漂移检测、prune、sync-wave、多集群策略"，本节是**带策略与多集群场景下每天敲的 Argo CD 运维命令**——从 Project 权限边界、多集群分发、回滚到典型排障。这是配置管理岗在"管一堆 app、跨好几个集群"时的实战面板。
+> **环境基准**：本机实测 `argocd v2.11.x`，已 `argocd login` 到控制面。
+
+#### ① 多集群与 context（cluster / context / app 分发）
+
+```bash
+argocd cluster list                              # 看所有已注册集群及当前选中
+argocd cluster add <kubecontext> --name prod     # 注册生产集群并起别名
+argocd context                                   # 看 CLI 当前指向哪个 Argo CD 服务/账号
+argocd app create web --repo ... --path prod --dest-server https://k8s.prod --dest-namespace web
+argocd app list -o wide                          # 宽表，含目标集群列（一眼看 app 落在哪）
+argocd app get web --show-params                 # 看 app 实际生效的参数（排查"配了没生效"）
+```
+
+> **实战价值**：多集群下 `app list -o wide` 能避免"以为改了 A 集群其实动的是 B 集群"。`--dest-server` 写错集群是生产事故高发区——CI 里用集群别名而非裸 URL，可读性更高也更不易错。
+
+#### ② Application 运维与回滚（get / sync / diff / rollback / history）
+
+```bash
+argocd app get web                               # 看树状资源 + 同步/健康状态
+argocd app sync web --strategy apply            # 指定同步策略（apply 或 hooks）
+argocd app sync web --prune --force             # 清理孤儿资源并强制纠 drift
+argocd app diff web                             # 预览 Git 期望 vs 集群实际（手动同步前必看）
+argocd app history web                          # 看每次同步的 revision 记录
+argocd app rollback web <REVISION>              # 回滚到某次 Git 提交（救火第一招）
+```
+
+> **实战价值**：带策略的 app 回滚要确认 `prune`/`selfHeal` 行为——回滚到旧 Git revision 时，若新版本才有的资源默认会被 prune 掉，这是"回滚后为什么少资源"的根因，面试常考。
+
+#### ③ 权限与策略（proj / rbac / account）
+
+```bash
+argocd proj list                                 # 看所有 AppProject 及其源/集群/命名空间白名单
+argocd proj get default                         # 看某个 Project 的权限边界
+argocd proj role list default                   # 看 Project 下的 RBAC 角色
+argocd account list                             # 看本地账号
+argocd rbac can <user> get apps '*' --project default   # 校验某用户在某 Project 有没有某权限
+argocd proj allow-cluster-resource default '*' '*'      # 放宽 Project 可管的资源范围（谨慎）
+```
+
+> **实战价值**：`rbac can` 是排"为什么这个用户看不到那个 app"的利器，把"没权限"和"资源不存在"一眼分开（类比 kubectl 的 `auth can-i`）。Project 是 Argo CD 多租户的隔离边界，面试常问"怎么让 A 团队只能动 A 的 namespace"。
+
+#### ④ 排障：OutOfSync / orphan / 同步卡死
+
+```bash
+argocd app get web -o yaml | grep -A5 status.sync   # 看同步状态细节与报错信息
+argocd app logs web --since 30m                    # 最近 30 分钟同步日志
+argocd app terminate-op web                        # 卡死的同步操作强制终止
+argocd app sync web --resource hook                # 只重跑 hook（如 PreSync Job 失败）
+kubectl -n web scale deploy web --replicas=9       # 制造 drift，验证 selfHeal / 检出
+argocd app wait web --operation                    # 等当前操作完成，流水线里卡同步
+```
+
+> **实战价值**：多集群下"同步卡死"常因目标集群网络不通或凭证失效——先看 `cluster list` 里该集群 `Status` 是否 `Successful`。孤儿资源（Git 删了但集群还在）靠 `--prune` 清；drift 靠 `selfHeal` 或 `sync --force` 纠。排障心法：**先看状态 → 再看 operation message / logs → 最后才是修**。
+
+---
+
 ## 4. 逐字段表
 
 ### 4.1 同步策略与注解对照表

@@ -862,4 +862,58 @@ kubectl rollout resume deployment/day2-web   # 恢复后才会推进
 
 ---
 
+## 9. 常用运维命令（Pod / Deployment 排障速查）
+
+> **本节能做什么**：L3 讲的是滚动更新机制，本节把**Deployment 生命周期里每天都会敲的排障命令**按场景归类——发布状态与回滚、在线改镜像与扩缩容、深度 describe/logs、以及"更新卡住"的实战排障。**这是 DevOps 岗值班最高频的一组命令。**
+
+### ① 发布状态与回滚（救火核心）
+
+```bash
+kubectl rollout status deployment/web -n prod            # 看这次发布是否就绪
+kubectl rollout history deployment/web -n prod           # 看历史版本（REVISION 只增不减）
+kubectl rollout history deployment/web --revision=3 -n prod   # 看某次 revision 改了啥
+kubectl rollout undo deployment/web -n prod              # 回滚到上一版（先恢复再查因）
+kubectl rollout undo deployment/web --to-revision=2 -n prod  # 回滚到指定版本
+kubectl rollout pause deployment/web -n prod             # 暂停发布（金丝雀：先放一小部分）
+kubectl rollout resume deployment/web -n prod            # 确认无误后继续
+```
+
+> **实战价值**：发布翻车**第一反应是 `rollout undo` 先恢复服务**，再去查根因，而不是改 yaml 重发；`pause`+`resume` 是实现"先发 1 个 Pod 观察"的轻量金丝雀手段。
+
+### ② 在线改镜像与扩缩容
+
+```bash
+kubectl set image deployment/web web=nginx:1.27 -n prod  # 改容器镜像（等价于改 template，触发滚动）
+kubectl scale deployment/web --replicas=5 -n prod        # 临时扩/缩副本
+kubectl rollout restart deployment/web -n prod           # 配置没变但要重启（滚动重启所有 Pod）
+kubectl get deploy web -n prod -o jsonpath='{.spec.strategy}'   # 看当前更新策略
+```
+
+> **实战价值**：`set image` 是触发滚动更新最干净的方式，比手改 yaml 更贴合"声明期望态"；`rollout restart` 在 ConfigMap 已更新但 Pod 不重载时常用（配合滚动重启让新挂载生效）。
+
+### ③ 深度排障（describe / logs / 新旧 RS）
+
+```bash
+kubectl describe deployment web -n prod       # 看 Conditions / 新旧 ReplicaSet / 事件
+kubectl describe pod <pod> -n prod            # Events + 容器状态 + Restart Count + 退出码
+kubectl logs <pod> -n prod -c web --tail=200 -f     # 跟随当前容器日志
+kubectl logs <pod> -n prod -p -c web          # 看上一个崩溃容器日志（关键，-p 不能省）
+kubectl get rs -n prod -l app=web             # 看新旧 ReplicaSet 副本分布（卡住时对比）
+```
+
+> **实战价值**：`CrashLoopBackOff` **必须用 `-p`**，否则看到的是重启后的空日志，永远找不到崩溃原因；`describe deployment` 的新旧 RS 副本数是判断"卡在滚动哪一步"的最快入口。
+
+### ④ 排障实战：滚动更新卡在 Progressing
+
+```bash
+kubectl rollout status deployment/web -n prod         # 现象：一直 Progressing，不变成 Complete
+kubectl describe deployment web -n prod | tail -20    # 看 Conditions 的 message
+kubectl get pods -l app=web -n prod -o wide           # 新 RS 的 Pod 是否 Ready
+# 典型：NewReplicaSet 0/1 Ready → ReadinessProbe 不过 → describe pod 看 Events（镜像拉不到/探针端口错）
+```
+
+> **读法**：滚动更新卡住基本是"新 Pod 起不来"。先看 `rollout status` 卡在哪，再看新 RS 的 Pod 状态，`describe pod` 的 Events 会直接给原因（ImagePullBackOff / Unhealthy / OOMKilled）。
+
+---
+
 **下一篇**：[`L4-Service与网络`](L4-Service与网络.md)（**Stable access entry · Four Service types · selector and targetPort · kube-proxy · DNS resolution**） · **上一篇**：[`L2-K8s架构与对象模型`](L2-K8s架构与对象模型.md) · **上一级**：[`00-学习地图与前置依赖`](../00-学习地图与前置依赖.md)

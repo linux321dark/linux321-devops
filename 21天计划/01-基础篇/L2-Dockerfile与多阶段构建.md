@@ -303,6 +303,120 @@ CMD ["/bin/app"]
 
 ---
 
+## 3.3 常用运维命令面板（按场景）
+
+> **本节能做什么**：3.1–3.2 是逐行拆解 Dockerfile，本节是**构建镜像 / 调试分层 / 验证瘦身时每天会敲的命令**——按场景归类，每条配真实例子。**Dockerfile 调试的肌肉记忆就来自这一张张表。**
+
+### ① 构建与缓存调试
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `docker build` | `docker build -t app:v1 -f Dockerfile .` | 标准构建，`.` 是构建上下文（别放根目录！） |
+| `--no-cache` | `docker build --no-cache -t app:v1 .` | 全量重建，排查"改了代码镜像没变"（缓存命中错） |
+| `--target` | `docker build --target builder -t app:dev .` | 多阶段只建到某阶段，单独验证编译是否通过 |
+| `--build-arg` | `docker build --build-arg VER=1.2 .` | 传构建期变量，区分环境 |
+| BuildKit 进度 | `docker build --progress=plain .` | 看每步详细输出，定位卡在哪条指令 |
+
+> **实战价值**：`--no-cache` 是"缓存背锅"时的终极验证——全量重建后还错，就不是缓存问题；重建后正常，回头调 COPY 顺序（L2 §2.2）。
+
+### ② 镜像分层分析
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `docker history` | `docker history --no-trunc app:v1` | 逐层看指令与体积，找"是谁把镜像撑大" |
+| `dive` | `dive app:v1` | 交互式看每层新增 / 删除的文件，优化分层神器 |
+| `docker inspect` | `docker inspect app:v1 \| grep -A20 GraphDriver` | 看层在宿主机的存储位置 |
+
+### ③ 镜像体积 / 瘦身验证
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `docker images` | `docker images app --format '{{.Tag}} {{.Size}}'` | 对比单阶段 vs 多阶段体积差异 |
+| 多阶段对比 | `docker build -f Dockerfile.old -t app:single . && docker build -t app:multi .` | 同代码两种写法量体积，用数据说话（面试加分） |
+| 体积告警 | `docker images --format '{{.Size}}\t{{.Repository}}' \| sort -h` | 排序找异常大的镜像 |
+
+### ④ 构建产物提取（多阶段拷产物）
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `docker create` + `cp` | `cid=$(docker create app:build); docker cp $cid:/dist/app ./; docker rm $cid` | 从构建阶段容器拷出二进制，验证产物正确 |
+| `docker run --rm` | `docker run --rm app:runtime ls /app` | 起一下看运行时里到底有什么文件 |
+
+### ⑤ 运行验证（ENTRYPOINT / CMD / PID 1）
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `docker run --rm` | `docker run --rm app:v1 /app --help` | 覆盖 CMD 传参数，验证可执行与参数解析 |
+| `docker inspect` | `docker inspect app:v1 --format '{{.Config.Entrypoint}} {{.Config.Cmd}}'` | 确认 ENTRYPOINT/CMD 真的如你所写 |
+| 信号测试 | `docker kill -s SIGTERM web` | 验证 PID1 能收到信号优雅退出（没 tini 会卡住） |
+
+> **实战价值**：没 `exec` 或没 tini 时，容器内进程不是 PID1，收不到 `SIGTERM`，`docker stop` 会等 10 秒强杀——这是"停容器慢 / 优雅停机失效"的常见根因。
+
+### ⑥ 本地 tag 与 registry 管理
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `docker tag` | `docker tag app:v1 registry/app:v1` | 改名才能推到目标仓库 |
+| `docker push` | `docker push registry/app:v1` | 推上去供别人拉 |
+| `docker rmi` | `docker rmi registry/app:v1` | 推完清本地，省磁盘 |
+
+### ⑦ .dockerignore 与构建上下文
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| 上下文大小 | `docker build --no-cache -t t . 2>&1 \| head` | 看 "Sending build context" 那行的大小 |
+| 验证忽略生效 | `cat .dockerignore` | 确认 node_modules/.git 被忽略，否则上下文暴涨拖慢构建 |
+| 误送排查 | `docker build --progress=plain .` | 看 COPY 是否把不该送的文件送进来了 |
+
+### ⑧ 构建失败定位
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| 失败层复用 | `docker build ... 2>&1 \| grep -A3 'Step'` | 看卡在哪一步、报错原文 |
+| 缓存命中判断 | `docker build .`（看输出 `Using cache`） | 确认哪些层命中缓存、哪些重跑 |
+| 中途调试 | `docker run -it <上一步成功层id> sh` | 在某层基础上手动跑，复现失败 |
+
+---
+
+## 3.4 入门排障实战（3 个场景串命令）
+
+> **把 3.3 的命令用起来**：三个最典型的构建故障，按"现象 → 敲的命令 → 怎么读"走一遍。**都在本地 Docker 上练。**
+
+### 场景 A：改了代码，构建出来还是旧逻辑（缓存没生效）
+
+```bash
+docker build --no-cache -t app:test .   # 全量重建，验证是不是缓存问题
+docker history app:test                  # 对比层
+# 若 --no-cache 后正常 → 原 Dockerfile 把易变代码 COPY 放在了依赖安装之前
+```
+
+> **读法**：缓存失效规则是"某层变了，它之后所有层重跑"。把 `COPY 源码` 放在 `RUN 装依赖` 之前就会一改代码全量重装。把依赖安装前置、源码后置（L2 §2.2）。
+
+### 场景 B：多阶段产物拷不过去（运行时里找不到文件）
+
+```bash
+docker create app:build > /tmp/cid && cid=$(cat /tmp/cid)
+docker cp $cid:/dist/app ./app_local     # 看构建阶段到底有没有这个文件
+docker rm $cid
+docker run --rm app:runtime ls /app      # 看运行时里有没有
+```
+
+> **读法**：`--from=builder` 拷的路径和 `COPY` 源路径对不上，或编译产物没落到预期目录。先 create+copy 把中间层文件取出来核对。
+
+### 场景 C：镜像体积没变小（以为用了多阶段其实没省）
+
+```bash
+docker images app            # 看体积有没有从 300MB 降到 12MB
+docker history app:v1        # 看基础镜像是不是还是完整 JDK/Go 环境
+# 常见根因：① 忘了多阶段，最终阶段还是 build 镜像；② 没用 distroless/scratch；③ 装了包没清索引
+```
+
+> **读法**：`history` 看最终阶段的基础镜像。没瘦下来八成是最终阶段没切到运行时镜像，或包管理索引没清（参考 L2 §3.1 的 `apk del` / `rm -rf`）。
+
+> **三个场景的共同心法**：**先看 `history`/体积 → 再定位是缓存 / 路径 / 基础镜像问题 → 最后改 Dockerfile**。一切以 `docker history` 和 `docker images` 的数据为准。
+
+---
+
 ## 4. Dockerfile 指令逐字段表
 
 | 指令 | 作用 | 产生层 | 关键注意点 |

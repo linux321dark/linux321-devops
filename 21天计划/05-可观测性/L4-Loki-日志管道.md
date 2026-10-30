@@ -40,7 +40,9 @@ L4 Loki 日志管道
 │   ├─ 3.1 起一套 Loki（monolith）+ 本地数据源
 │   ├─ 3.2 设计标签方案（先设计，再采集）
 │   ├─ 3.3 写 LogQL：三级过滤 + 解析 + 格式化
-│   └─ 3.4 验证管道通不通（删 Pod 仍能查到）
+│   ├─ 3.4 验证管道通不通（删 Pod 仍能查到）
+│   ├─ 3.5 常用运维命令（按场景）
+│   └─ 3.6 运维排障实战（场景串命令）
 │
 ├─ 4. 逐字段表
 │   ├─ 4.1 LogQL 过滤操作符表
@@ -974,6 +976,121 @@ sum by (app) (rate({namespace="prod"} |= "ERROR" [5m]))
 **注意第 ⑤ 步的时间窗**：Loki 的查询有时间范围，**默认只查最近 1 小时**。**删 Pod 后要查旧日志，必须把时间范围往前拨**，否则会误判成"没查出来"。
 
 **这个动作为什么重要**：它区分了"装了个 Loki"和"建了条日志管道"。**没有这一步，"日志已脱离容器生命周期"这句话就是空话。**
+
+---
+
+### 3.5 常用运维命令（按场景）
+
+> **本节能做什么**：3.1–3.4 是"把日志管道建起来"，本节是**日常查日志、排采集端、查标签、验组件健康**的 Loki 运维命令——按场景归类，每条配真实例子。**Loki 排障的肌肉记忆就来自这一张表。**
+
+### ① 用 logcli 查日志（命令行版的 Explore）
+
+```bash
+logcli query '{namespace="prod",app="order-service"}' --limit=100            # 查最近日志
+logcli query '{namespace="prod"} |= "error"' --since=1h                      # 行过滤：含 error 的
+logcli query '{namespace="prod"}' --tail                                      # 持续跟随（类似 tail -f）
+logcli query '{namespace="prod"}' --stats                                     # 看查询统计（扫描量/匹配行数）
+logcli labels                                                                 # 看有哪些流标签
+logcli labels namespace                                                       # 看某个标签有哪些值
+```
+
+> **实战价值**：`logcli` 就是 Loki 的 `kubectl logs`——**不打开 Grafana 也能查日志，排障和写脚本都靠它**。`--stats` 能暴露"这次查询扫了多少 chunk"，是查慢的根因入口（§2.14 标签基数）。
+
+### ② Loki API 验端点（标签排查的底层接口）
+
+```bash
+curl -s 'http://localhost:3100/loki/api/v1/labels' | head -c 400               # 看有哪些索引标签（流标签）
+curl -s 'http://localhost:3100/loki/api/v1/label/namespace/values' | head -c 400  # 看 namespace 标签有哪些值
+curl -s 'http://localhost:3100/loki/api/v1/query_range?query={namespace="prod"}&limit=10' | head -c 600  # 直接打查询 API
+curl -s 'http://localhost:3100/ready' ; curl -s 'http://localhost:3100/live'  # 健康探针
+```
+
+> **实战价值**：`/loki/api/v1/labels` 是**标签排查的第一入口**——§3.4 说过"第一级查不到先确认标签真实存在"。查询报 "no streams match" 时，先打这个接口看标签值拼对了没，比调 LogQL 快。
+
+### ③ 标签排查与高基数（Loki 的头号事故源）
+
+```bash
+curl -s 'http://localhost:3100/loki/api/v1/labels'                  # 看流标签集合（应保持低基数）
+logcli query '{namespace="prod"}' --stats --quiet 2>&1 | grep -i stream   # 看这次查匹配了多少流
+# 高基数症状：查询慢、ingester 内存涨 → 回到 §2.3 / 2.14 收紧标签
+```
+
+> **实战价值**：Loki 的查询性能**完全由标签基数决定**（§2.3）。`/loki/api/v1/labels` 里出现 `user_id`/`trace_id`/`ip` 这类高基标签，就是事故前兆——用 `--stats` 看流数量能提前发现。这是面试"Loki 为什么慢"的必答点。
+
+### ④ 采集端排障（Promtail / Alloy 没推上来）
+
+```bash
+curl -s http://localhost:9080/targets          # Promtail 的 targets 接口：看哪些日志路径在被采集
+curl -s http://localhost:12345/debug/metrics/prometheus   # Alloy 暴露的自身指标
+ps aux | grep -E 'promtail|alloy' | grep -v grep          # 进程在不在
+# position 文件：记录读到哪了，卡住时清它重新追（注意会重复采集）
+ls -lh /var/lib/promtail/positions.yml
+```
+
+> **实战价值**：日志查不到，**先分清是"采集端没推"还是"查询端写错"**。Promtail 的 `/targets` 空 = 路径/服务发现没匹配到；position 文件卡住会导致"新日志不进 Loki"，清掉重追即可（会重复，需评估）。
+
+### ⑤ 组件与存储状态（distributor / ingester / querier）
+
+```bash
+curl -s http://localhost:3100/ready            # 各组件都 ready 才算活
+curl -s http://localhost:3100/loki/api/v1/status/metrics  # 内部指标（ingester 内存、chunk 数）
+curl -s http://localhost:3100/loki/api/v1/tenant/usage   # 租户用量（多租户场景）
+ss -ltnp | grep 3100                           # 端口
+```
+
+> **实战价值**：Loki 多组件部署（§2.9 simple-scalable / microservices）时，某个 ingester 不 ready 会导致写入失败——`/ready` 是健康总闸，k8s 探针就接它；`/status/metrics` 看 ingester 内存压力。
+
+### ⑥ 通用：端口、进程、配置校验
+
+```bash
+ss -ltnp | grep -E '3100|9080|9095'     # Loki / Promtail / memberlist 端口
+ps aux | grep -E 'loki|promtail|alloy' | grep -v grep
+loki -config.file=/etc/loki/loki-config.yaml -print-config-stderr   # 打印生效配置确认
+```
+
+> **实战价值**：Loki 配置改完不生效，用 `-print-config-stderr` 看"实际加载的是哪份、参数是什么"；组件端口不通先 `ss` 看进程活没活。**先确认进程在，再谈查日志。**
+
+---
+
+### 3.6 运维排障实战（场景串命令）
+
+> **把 3.5 的命令用起来**：三个最典型的 Loki 故障，按"现象 → 敲的命令 → 怎么读"走一遍。**用 §3.4 的"删 Pod 仍能查到"动作当验收基准，别在真集群试。**
+
+### 场景 A：LogQL 查询返回 "no streams match selector"（查不到）
+
+```bash
+curl -s 'http://localhost:3100/loki/api/v1/labels'                   # 看有哪些流标签
+curl -s 'http://localhost:3100/loki/api/v1/label/namespace/values'  # 看 namespace 标签的真实值
+logcli query '{namespace="prod"}' --limit=5                          # 先用最粗的 selector 试
+# 典型：namespace 写错大小写 / 用了非索引标签当流选择器 / 多租户漏了 X-Scope-OrgID 头
+```
+
+> **读法**："no streams match"**先确认标签真实存在且值拼对**——`/loki/api/v1/labels` + 对应标签的 values 接口是真相。多租户场景漏 `X-Scope-OrgID` 头也会全空（§2.11）。**别急着改 LogQL，先确认 selector 命不命中。**
+
+### 场景 B：采集端没把日志推上来（Promtail / Alloy 侧）
+
+```bash
+curl -s http://localhost:9080/targets          # Promtail targets：看路径有没有被匹配
+ps aux | grep promtail | grep -v grep          # 进程在不在
+ls -lh /var/lib/promtail/positions.yml         # position 卡住没
+curl -s 'http://localhost:3100/loki/api/v1/query_range?query={namespace="prod"}&limit=5'  # Loki 端有没有数据
+# 典型：targets 为空 = 路径/label 没匹配；positions 卡住 = 新日志不追
+```
+
+> **读法**：Loki 端查不到，**先去采集端 `/targets` 看有没有目标**——空就说明服务发现/路径没配好；进程在但 position 卡住，清 position 重追。区分"采集端没推"还是"查询端写错"是排 Loki 的第一原则。
+
+### 场景 C：查询特别慢 / ingester 内存打满（高基数爆炸）
+
+```bash
+logcli query '{namespace="prod"}' --stats            # 看这次查询扫了多少流/chunk
+curl -s 'http://localhost:3100/loki/api/v1/labels'   # 看流标签里有没有高基标签
+curl -s 'http://localhost:3100/loki/api/v1/status/metrics' | grep -i 'ingester.*memory\|chunks'  # ingester 压力
+# 典型：流标签里混入了 user_id/trace_id → 流数量爆炸
+```
+
+> **读法**：慢 + 内存涨 = 高基数（§2.14）。`--stats` 看流数量，若几十万级就是标签爆炸；`/loki/api/v1/labels` 揪出罪魁标签，回到采集端收紧标签（用 `pipeline_stages` 把高基字段改成行内容而非标签）。**Loki 慢几乎只有这一个根因。**
+
+> **三个场景的共同心法**：**先分清"采集端没推"还是"查询端写错"，再谈具体命令。** Loki 排障 90% 的时间花在"标签"上——查不到看标签、慢也看标签。
 
 ---
 

@@ -1022,6 +1022,119 @@ kubectl uncordon day2-worker
 
 ---
 
+## 9. 面试最常考命令速查（按工具分类）
+
+> **本节能做什么**：CKA 考的是 K8s 单点操作，但**真去面试 DevOps / 配置管理岗，面试官会顺手考你一整套工具链的命令肌肉记忆**——kubectl 排障四件套、docker 发布、git 协作、helm 发布、redis/psql 排障、CI 提速。本节把这几类**面试最高频的命令**按工具归类，**每条配真实实例 + 面试常问场景**，考前过一遍就能直接背。
+
+### ① kubectl：排障四件套 + 发布 / 节点维护
+
+```bash
+# 排障四件套（90% 的 K8s 故障卡在这四步）
+kubectl get pods -o wide -n prod               # 1) 看状态：STATUS / NODE / RESTARTS 一眼分
+kubectl describe pod <name> -n prod            # 2) 看 Events 与 Last State（Pending/Crash 真相入口）
+kubectl logs <pod> -p --tail=100 -c <c>        # 3) 看崩溃前日志（关键 -p，否则看到的是重启后的空日志）
+kubectl exec -it <pod> -- sh                   # 4) 进容器看环境变量 / 文件 / 网络
+
+# 发布与回滚
+kubectl rollout status deployment/web          # 看这次发布是否就绪
+kubectl rollout history deployment/web         # 看历史版本
+kubectl rollout undo deployment/web --to-revision=2   # 回滚到指定版本（救火第一招）
+
+# 临时调试（镜像无 shell 时救命）
+kubectl debug <pod> -it --image=busybox --target=<c>   # 加临时容器排障
+
+# 节点维护（上线 / 重启 / 缩容前必做）
+kubectl cordon <node>                          # 标记不可调度
+kubectl drain <node> --ignore-daemonsets --delete-emptydir-data  # 驱逐 Pod 准备维护
+kubectl uncordon <node>                        # 维护完恢复调度
+```
+
+> **面试常问场景**："Pod 一直 Pending / CrashLoopBackOff 你怎么排？""发布翻车怎么救？""节点要重启你怎么安全下线？"——答案就是上面这套：先 `get` / `describe` / `logs -p` / `exec` 四件套定位，再 `rollout undo` 或 `cordon`→`drain`→`uncordon`。**能把这个顺序讲顺，K8s 排障就不丢分。**
+
+### ② docker：构建 / 运行 / 进容器 / 清理
+
+```bash
+# 构建与运行
+docker build -t registry.local/web:v1.2 .                 # 按 Dockerfile 构建并打 tag
+docker run -d --name web -p 8080:80 -e ENV=prod web:v1.2  # 后台起容器，映射端口 / 注入环境变量
+docker ps -a                                              # 看所有容器（含已退出的）
+
+# 进容器与看日志
+docker exec -it <cid> sh                                 # 进容器排障（有 bash 用 bash）
+docker logs -f --tail=100 <cid>                          # 跟随看最后 100 行日志
+
+# 清理（别让悬空镜像堆满磁盘）
+docker system prune -f                                   # 清悬空镜像 / 停止容器 / 网络
+docker image prune -a --filter "until=24h"               # 清 24 小时前未被使用的镜像
+```
+
+> **面试常问场景**："镜像太大怎么瘦身？""容器一直重启你查什么？""磁盘被 docker 占满怎么清？"——`docker build` 的 layer 缓存、多阶段构建，`docker logs -f`、`docker system prune` 是必背。能说出**多阶段构建减少体积**和**`prune` 释放磁盘**一般就够了。
+
+### ③ git：协作 / 回退 / 救场
+
+```bash
+git merge --no-ff feature/x        # 保留分支历史的合并（面试偏好，能看出从哪来）
+git rebase main                    # 把当前分支变基于最新 main（线性历史，慎用已推送分支）
+git reset --soft HEAD~1            # 回退提交但保留改动到暂存区（改 commit message 用）
+git reset --hard HEAD~1            # 硬回退并丢弃改动（慎用，会丢工作）
+git cherry-pick <commit>           # 只挑某个提交到当前分支（热修常用）
+git stash && git stash pop         # 临时存改动去切分支修紧急 bug
+git reflog                         # 看 HEAD 变动历史（reset --hard 后还能找回提交）
+```
+
+> **面试常问场景**："rebase 和 merge 区别？""误 `reset --hard` 了怎么救？""线上热修一个提交怎么操作？"——核心答点：**rebase 改历史、merge 留痕迹**；**`reflog` 是后悔药**，`reset --hard` 后还能 `reflog` 找回来；热修用 `cherry-pick` 精准搬运。
+
+### ④ helm：K8s 应用打包与发布
+
+```bash
+helm install web ./chart -n prod --set replicaCount=3   # 装一个 release（覆盖 values）
+helm upgrade web ./chart -n prod --reuse-values         # 升级（保留旧 values）
+helm rollback web 2                                     # 回滚到第 2 个版本（发布救火）
+helm template ./chart -n prod                          # 本地渲染出 yaml（不真正部署，CI 校验用）
+helm lint ./chart                                       # 静态检查 chart 语法与最佳实践
+```
+
+> **面试常问场景**："helm 怎么回滚？""怎么在不部署的情况下验证 chart 写对了？""chart 上线前怎么卡质量？"——`helm rollback` 是发布救火标准动作；`helm template` 把模板渲染成 yaml 给 Review/CI 用；`helm lint` 挡低级错误。能讲清 **release 版本化 = 天然支持回滚** 是加分点。
+
+### ⑤ redis-cli：缓存排障与慢查询
+
+```bash
+redis-cli INFO memory              # 看内存占用、碎片率（内存打满排查第一入口）
+redis-cli INFO stats               # 看命中率 / 总命令数（命中率低说明缓存设计有问题）
+redis-cli --scan --pattern "sess:*"     # 游标遍历大 key（线上禁 KEYS *，会阻塞）
+redis-cli TTL sess:abc123          # 看某个 key 剩余过期时间（缓存穿透 / 雪崩排查）
+redis-cli SLOWLOG GET 10           # 取最近 10 条慢查询（定位耗时命令）
+```
+
+> **面试常问场景**："线上 redis 慢怎么查？""为什么不能用 KEYS *？""缓存命中率低怎么看？"——答点：**`--scan` 替代 `KEYS *` 避免阻塞**；`INFO memory` 看内存、`SLOWLOG` 看慢命令、`TTL` 看过期策略。能说出 **KEYS 会阻塞主线程、大集群必炸** 是基本功。
+
+### ⑥ psql：PostgreSQL 排障
+
+```bash
+psql -d app -c "\d orders"                              # 看表结构（列 / 索引 / 约束）
+psql -d app -c "EXPLAIN ANALYZE SELECT ..."             # 看真实执行计划（慢 SQL 第一入口）
+psql -d app -c "SELECT * FROM pg_stat_activity WHERE state='active';"  # 看活跃连接（锁 / 长事务排查）
+psql -d app -c "SELECT pid, wait_event_type FROM pg_stat_activity WHERE wait_event_type='Lock';"  # 看锁等待
+pg_dump -Fc -d app -f app.dump                          # 逻辑备份（可配合 cron 做定时备份）
+```
+
+> **面试常问场景**："慢 SQL 怎么定位？""数据库连满 / 锁等待怎么查？""怎么做备份？"——答点：`EXPLAIN ANALYZE` 是慢查询定位标配；`pg_stat_activity` 看活跃连接与锁；`pg_dump` 做逻辑备份。能说清 **`EXPLAIN` 看预估、`EXPLAIN ANALYZE` 看真实执行** 区别是加分项。
+
+### ⑦ CI：构建提速与远程触发
+
+```bash
+# Maven 模块化构建（只构建改动模块及其依赖，CI 提速关键）
+mvn -pl module-a -am clean package    # -pl: 指定模块；-am: also-make 连同依赖模块一起构建
+
+# Jenkins 远程触发 / 查状态
+java -jar jenkins-cli.jar -s https://ci.x.com/ build job-a -p BRANCH=main -f   # 触发构建并跟随日志
+java -jar jenkins-cli.jar -s https://ci.x.com/ console job-a 12                # 看某次构建控制台
+```
+
+> **面试常问场景**："大仓 monorepo 构建太慢怎么优化？""怎么在 pipeline 外触发 Jenkins 任务？"——答点：**`mvn -pl -am` 只构建受影响模块**，避免全量编译；jenkins-cli 适合在脚本 / 其他系统里驱动任务。能讲出 **-am 解决依赖链、避免漏编** 是实战经验体现。
+
+---
+
 ## 附：待验证清单
 
 | # | 待验证项 | 涉及章节 | 验证方法 |

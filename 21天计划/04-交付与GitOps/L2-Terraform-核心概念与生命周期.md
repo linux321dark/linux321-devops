@@ -1033,6 +1033,65 @@ terraform destroy
 
 ---
 
+### 3.4 常用运维命令（Terraform 日常工作流，按场景）
+
+> **本节能做什么**：3.1–3.3 是"把基础设施写成代码"，本节是**每天值班 / 面试都会敲的 Terraform 运维命令**——从 `plan`/`apply` 到状态管理、资源纳管、drift 排查。配置管理 / DevOps 岗的 IaC 肌肉记忆就来自这一张表。
+> **环境基准**：本机实测 `terraform v1.9.x`，provider 以 `alicloud` 为例。
+
+#### ① 日常工作流（init / fmt / validate / plan / apply / destroy）
+
+```bash
+terraform init                              # 初始化：下载 provider、配置 backend（改 provider 后必跑）
+terraform fmt -recursive                    # 递归格式化所有 .tf 文件（提交前必跑，CI 里也跑）
+terraform validate                          # 静态校验语法与变量引用（不动真实资源）
+terraform plan                              # 预览这次会创建/修改/销毁什么（上线前必审）
+terraform plan -out=tfplan                  # 把 plan 存成文件，apply 时直接吃这个（避免 plan/apply 中间态漂移）
+terraform apply -auto-approve               # 直接执行（日常可，生产建议先审 plan）
+terraform destroy                           # 销毁 plan 里标记的资源（危险，先 plan 确认）
+```
+
+> **实战价值**：`plan -out` + `apply tfplan` 是**生产环境的黄金组合**——保证你审过的那一份 plan 就是真正执行的那一份，杜绝"审的时候没删库、执行时却删了"的中间态事故。`fmt -recursive` 让团队 diff 干净，是 Code Review 的隐形门槛。
+
+#### ② 状态管理（state list / show / rm / pull / push / force-unlock）
+
+```bash
+terraform state list                        # 看当前 state 里有哪些资源
+terraform state show alicloud_vpc.example  # 看某个资源的完整属性（排查"实际值是什么"）
+terraform state rm alicloud_vpc.example    # 把资源从 state 移除（不删真实资源，慎用）
+terraform state mv alicloud_vpc.a alicloud_vpc.b  # 重命名资源（改代码后同步 state，避免销毁重建）
+terraform force-unlock <LOCK_ID>           # state 被锁（上次 apply 中断）时强制解锁（慎用）
+terraform refresh                          # 把真实云上状态拉回来对齐 state（drift 复原计划第一步）
+```
+
+> **实战价值**：state 是唯一真相源。`state rm` 误用会让你"以为删了其实没删"。`force-unlock` 前**先确认没有别人正在跑**，否则会破坏并发操作。`state mv` 是重构代码后避免资源重建的关键——面试常考"改了 resource 名怎么不重建"。
+
+#### ③ 资源纳管与调试（import / taint / untaint / output / console / workspace）
+
+```bash
+terraform import alicloud_vpc.example vpc-abc123   # 把已有的手工资源纳管进 state
+terraform taint alicloud_instance.web             # 标记该资源下次 apply 强制重建
+terraform untaint alicloud_instance.web           # 撤销 taint
+terraform output vpc_id                           # 打印某个 output 值（和其他系统对接用）
+terraform console                                 # 开交互式表达式求值（试 `var.x`、`module.y.z`）
+terraform workspace list                          # 看有哪些 workspace（多环境隔离）
+terraform workspace select staging                # 切到 staging 环境（各自独立 state）
+```
+
+> **实战价值**：`import` 是"存量资源 IaC 化"的必经之路，面试高频。`taint` 在"配置改了但不生效"时强制重建一台机器。`workspace` 用一套代码管多套环境，是 Terraform 多环境的标准玩法。
+
+#### ④ 排障：drift 检测与锁
+
+```bash
+terraform plan                             # 出现 "1 to change, 0 to add..." 说明云上和 state 漂了
+terraform refresh && terraform plan        # 先对齐真实状态再判断是不是真漂移
+terraform plan -detailed-exitcode          # 退出码 0=无变更 1=错误 2=有变更（CI 里判断要不要 apply）
+terraform apply -lock-timeout=120s         # 拿锁超时时间，避免别人占锁时直接退出
+```
+
+> **实战价值**：drift（云上被人手改了）是 IaC 的永恒敌人。定期 `plan` 看有没有非预期变更，是 GitOps 里"声明即真相"的守门员。CI 里用 `-detailed-exitcode` 精确区分"无变更 / 有变更 / 出错"三种状态。
+
+---
+
 ## 4. 逐字段表
 
 ### 4.1 HCL 块类型表

@@ -321,6 +321,127 @@ docker volume rm lab-vol
 
 ---
 
+## 3.5 常用运维命令面板（按场景）
+
+> **本节能做什么**：3.1–3.4 是镜像 / 容器 / 网络 / 存储的"基础操作"，本节是**每天值班都会敲的 Docker 运维排障命令**——按场景归类，每条配真实例子。**Docker 运维的肌肉记忆就来自这一张张表。**
+
+### ① 镜像管理
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `docker images` | `docker images --format '{{.Repository}} {{.Size}}'` | 看本地镜像与体积，清理前先盘点 |
+| `docker rmi` | `docker rmi $(docker images -f dangling=true -q)` | 删悬空镜像，回收磁盘空间 |
+| `docker tag` | `docker tag app:v1 registry.cn-hz/aliyun/app:v1` | 改名打 tag 才能推到目标仓库 |
+| `docker history` | `docker history --no-trunc app:v1` | 看每一层怎么来的、占多大，定位"镜像为什么这么大" |
+| `docker inspect` | `docker inspect app:v1 \| grep -i created` | 看镜像元数据（构建时间、架构） |
+
+> **实战价值**：`docker history` 是判断镜像膨胀的第一入口——哪条指令加了 200MB 一眼可见，比盲猜快得多。
+
+### ② 容器生命周期
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `docker ps` | `docker ps -a --filter status=exited` | 看所有容器（含已退出），`-a` 是排障第一步 |
+| `docker run` | `docker run -d -p 8080:80 --name web nginx` | 起容器并映射端口，最常用起手式 |
+| `docker stop/start` | `docker stop web && docker start web` | 优雅停 / 启，发布轮换用 |
+| `docker rm` | `docker rm -f web` | 强删容器，`-f` 先 stop 再删 |
+| `docker rename` | `docker rename old new` | 改容器名，避免冲突 |
+
+### ③ 容器排障（最高频）
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `docker logs` | `docker logs --tail=100 -f web` | 持续看日志，`-f` 跟随，`--tail` 只看末尾 |
+| `docker exec` | `docker exec -it web sh` | 进容器排障，有 bash 用 bash |
+| `docker inspect` | `docker inspect web --format '{{.State.ExitCode}}'` | 看退出码 / 状态 / IP，排"容器为什么崩" |
+| `docker stats` | `docker stats web` | 实时看容器 CPU / 内存 / IO 占用 |
+| `docker top` | `docker top web` | 看容器内跑了哪些进程 |
+
+> **实战价值**：容器起不来时**必须看 ExitCode**——137=OOM（加内存 limit），126/127=命令找不到或权限问题，非 0=应用自身报错。别猜，看退出码。
+
+### ④ 资源与清理（别让死容器堆满磁盘）
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `docker system df` | `docker system df` | 看镜像 / 容器 / 卷占了多少空间 |
+| `docker system prune` | `docker system prune -a --volumes` | 一键清悬空资源，**`-a` 连未用镜像一起删，慎用** |
+| `docker volume prune` | `docker volume prune` | 清无人使用的卷，回收磁盘 |
+| 批量清容器 | `docker rm -f $(docker ps -aq)` | 测试机重置用，生产禁手滑 |
+
+### ⑤ 镜像构建
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `docker build` | `docker build -t app:v1 -f Dockerfile .` | 标准构建，`-f` 指定文件，`.` 是上下文 |
+| `--no-cache` | `docker build --no-cache -t app:v1 .` | 强制全量重建，排查缓存导致的"旧代码还在" |
+| `--target` | `docker build --target builder -t app:dev .` | 多阶段只构建到某阶段，调试中间层 |
+| `buildx` | `docker buildx build --platform linux/arm64 -t app:v1 .` | 跨架构构建（L3 细讲） |
+
+### ⑥ 网络与端口排查
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `docker network ls` | `docker network ls` | 看有哪些网络 |
+| `docker port` | `docker port web` | 看容器端口映射关系 |
+| `docker network inspect` | `docker network inspect bridge` | 看网络里有哪些容器、IP 段 |
+| 进容器测连通 | `docker exec web curl -s http://other:80` | 容器间能不能通，直接在里面测 |
+
+### ⑦ 存储挂载排查
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `docker volume inspect` | `docker inspect lab-vol` | 看卷在宿主机的真实路径 |
+| 绑定挂载权限 | `docker run -v $(pwd):/app app` | 权限不对先查属主 / SELinux，不是镜像问题 |
+
+### ⑧ 容器与宿主机互拷文件
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `docker cp` 出 | `docker cp web:/var/log/app.log ./` | 把容器内日志拷出来分析 |
+| `docker cp` 入 | `docker cp ./fix.sh web:/tmp/` | 拷修复脚本进容器临时救火 |
+
+---
+
+## 3.6 入门排障实战（3 个场景串命令）
+
+> **把 3.5 的命令用起来**：三个最典型的入门故障，按"现象 → 敲的命令 → 怎么读"走一遍。**都在本地 Docker 上练，别在真集群试。**
+
+### 场景 A：容器一直退出 / Restarting（起不来）
+
+```bash
+docker ps -a                                                 # 现象：STATUS=Exited(1) 或 Restarting
+docker logs --tail=50 web                                    # 看退出前日志，找报错
+docker inspect web --format '{{.State.ExitCode}} {{.State.Error}}'   # 看退出码
+# Exit 137 = OOM（加内存）；非 0 = 应用自身报错（看日志）
+```
+
+> **读法**：`docker ps -a` 拿到退出码，`logs` 看崩溃原因。137=OOM，126/127=命令找不到或权限，1=应用报错。别猜，看 ExitCode。
+
+### 场景 B：镜像体积异常大（构建没瘦身）
+
+```bash
+docker images app            # 看体积
+docker history app:v1        # 逐层看哪层暴涨
+docker build --no-cache -t app:test .   # 怀疑缓存作祟时全量重建对比
+```
+
+> **读法**：`history` 直接告诉你"哪条指令加了 200MB"。多半是忘了多阶段（L2 解决）或装了包没清索引。
+
+### 场景 C：容器间网络不通（A 访问不了 B）
+
+```bash
+docker network ls                       # 确认两容器在同一网络
+docker network inspect mynet            # 看各自 IP
+docker exec a curl -s http://b:80       # 进容器直连，绕过 DNS 先验应用
+docker exec a nslookup b                # 再看 DNS 通不通
+```
+
+> **读法**：默认 bridge 下容器名互通需同自定义网络；先端口直连验应用本身，再验 DNS，分层定位。
+
+> **三个场景的共同心法**：**先 `ps`/`logs` 看状态与日志 → 再 `inspect`/history 看原因 → 最后才是修**。和 K8s 篇一致：证据优先。
+
+---
+
 ## 4. 关键命令逐个解释
 
 ### 4.1 `docker run` 的执行顺序（很多人不知道）
@@ -346,7 +467,7 @@ docker run -d --name web -p 8080:80 nginx:alpine
 
 ```bash
 docker inspect <name> --format '{{.State.Status}}'          # 状态
-docker inspect <name> --format '{{.NetworkSettings.IPAddress}}'
+docker inspect <name> --format '{{.Networks.IPAddress}}'
 docker inspect <name> --format '{{json .Config.Env}}'        # 环境变量
 docker inspect <name> --format '{{.Mounts}}'                 # 挂载
 docker inspect <name> --format '{{.State.ExitCode}}'        # 退出码

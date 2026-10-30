@@ -977,6 +977,116 @@ deploy-prod:
 
 ---
 
+## 3.4 常用运维命令面板（按场景）
+
+> **本节能做什么**：3.2 是"一条完整流水线的写法"，本节是**每天值班 / 面试都会敲的 GitLab CI 运维排障命令**——按场景归类，每条配真实例子。**CI 排障的肌肉记忆就来自这一张表。**
+
+### ① 语法预检（提交前先拦住低级错）
+
+```bash
+# 用 GitLab 官方的 CI Lint API 校验 .gitlab-ci.yml（不用真触发流水线）
+curl --header "PRIVATE-TOKEN: <你的token>" \
+     --form "content=<$(cat .gitlab-ci.yml)" \
+     "https://gitlab.example.com/api/v4/ci/lint"
+# 返回 { "valid": true/false, "errors": [...] }——push 前先跑一遍
+
+# 本地用 gitlab-ci-yml 社区工具做静态检查（需 Node 环境）
+npx gitlab-ci-yml-validator .gitlab-ci.yml     # 本地快速验结构
+```
+
+> **实战价值**：`ci/lint` 是"提交前最后一道语法闸"。很多团队把 lint 接进 pre-commit 钩子，**把 `yaml 缩进错 / stage 没定义 / needs 指向不存在的 job` 这类错在本地就拦掉**，而不是等流水线红。
+
+### ② 流水线 / Job 生命周期管理
+
+```bash
+glab ci list                                   # 列出最近流水线
+glab ci view <pipeline-id>                     # 看某条流水线的所有 job 与状态
+glab ci status                                 # 当前分支最新流水线状态
+glab ci retry <job-id>                         # 重试某个失败的 job（不重跑整条）
+glab ci cancel <pipeline-id>                   # 取消一条正在跑的流水线
+glab ci trace <job-id>                         # 实时跟某个 job 的日志（等价于网页点进去）
+```
+
+> **实战价值**：**面试常问"流水线卡住你怎么看"**——第一步永远是 `glab ci view` 看哪个 job 卡、状态是什么（pending / running / failed / canceled），再决定 retry 还是 cancel。重试单个 job 比重跑整条省时间，也避免把已经过的 stage 再跑一遍。
+
+### ③ Runner 注册与排查
+
+```bash
+gitlab-runner register                          # 交互式注册（填 URL / token / executor）
+gitlab-runner verify                            # 校验本机 runner 能不能连上 GitLab（心跳）
+gitlab-runner status                            # 看 runner 进程在不在、是不是 active
+gitlab-runner list                              # 列出本机注册过的 runner 及其状态
+sudo gitlab-runner restart                      # runner 抽风时重启服务
+sudo gitlab-runner uninstall && gitlab-runner install  # 服务注册坏了重建
+```
+
+> **实战价值**：`verify` 是判断"runner 离线还是 job 本身挂"的第一招——`verify` 通说明 runner↔GitLab 链路没问题，问题在 job 脚本；`verify` 不通说明 **token 过期 / 网络不通 / 服务没起**，去查 `/var/log/gitlab-runner/`。
+
+### ④ 变量与密钥排查
+
+```bash
+glab variable list -p <project>                 # 看项目级 CI 变量有哪些（不显示值）
+glab variable get CI_REGISTRY_TOKEN -p <project> # 查某个变量（值是否 masked 看不到明文）
+# 在 job 日志里确认变量是否被正确注入：
+echo "$CI_COMMIT_REF_NAME / $CI_PIPELINE_ID"     # 内置变量随手打印，排"环境判断错"
+```
+
+> **实战价值**：**"变量没生效"是 CI 里最隐蔽的错之一**。Protected 变量只在 protected 分支/tag 才注入，普通分支跑出来是空——`glab variable list` 先看作用域，再在 job 里 `echo` 内置变量定位是"没传"还是"传了但作用域不对"。
+
+### ⑤ 排障：流水线卡 pending / runner 离线
+
+```bash
+glab ci view <pipeline-id>                      # 看卡住的 job：status=pending 说明在等 runner
+gitlab-runner verify                            # runner 侧：能不能连上 GitLab
+gitlab-runner status                            # runner 进程活不活
+sudo systemctl status gitlab-runner             # 服务级状态（dead 就 restart）
+# 网页 Admin → Runners 看 runner 是不是被 paused / 是不是 tag 不匹配
+```
+
+> **实战价值**：job 一直 `pending` 只有三种可能——**没有匹配的 runner（tag 不对）、runner 被 paused、runner 离线**。先 `verify`+`status` 在 runner 侧定位，再回网页看 tag/paused，别一上来就改 `.gitlab-ci.yml`。
+
+---
+
+## 3.5 GitLab CI 排障实战（3 个场景串命令）
+
+> **把 3.4 的命令用起来**：三个最典型的 CI 故障，按"现象 → 敲的命令 → 怎么读"走一遍。**优先在测试项目上练，别在主干试。**
+
+### 场景 A：流水线一直 pending（等不到 runner）
+
+```bash
+glab ci view <pipeline-id>                      # 现象：job 状态 pending，一直不动
+gitlab-runner status                            # runner 进程 active 吗？
+gitlab-runner verify                            # 能连上 GitLab 吗？报错就是 token/网络
+# 网页 Admin → Runners：看该 runner 的 tag 与 job 的 tags 是否对得上
+```
+
+> **读法**：pending = 没人接单。`verify` 通但还 pending → **tag 不匹配或 runner 被 paused**（网页看）；`verify` 不通 → runner 离线/服务挂，去 `systemctl restart gitlab-runner`。
+
+### 场景 B：job 失败，但不知道卡在哪
+
+```bash
+glab ci trace <job-id>                          # 实时跟日志，定位失败的那一行
+glab ci retry <job-id>                          # 修完依赖/脚本后只重跑这一个 job
+echo "$CI_COMMIT_REF_NAME"                      # 在 job 里打印内置变量，确认环境判断对不对
+```
+
+> **读法**：`trace` 看到底是测试挂、构建挂还是推送 401；**重试单个 job** 比重跑整条快，也避免把 lint/build 这种已经过的再跑一遍。
+
+### 场景 C：`.gitlab-ci.yml` 推上去就报语法错
+
+```bash
+curl --header "PRIVATE-TOKEN: <token>" \
+     --form "content=<$(cat .gitlab-ci.yml)" \
+     "https://gitlab.example.com/api/v4/ci/lint"   # 提交前本地先 lint
+npx gitlab-ci-yml-validator .gitlab-ci.yml         # 或社区工具静态校验
+```
+
+> **读法**：返回 `valid: false` 会带 `errors` 数组，常见是 **stage 没在 stages 里定义、needs 指向不存在的 job、yaml 缩进错**。本地 lint 一遍再推，比等流水线红省一轮往返。
+
+> **三个场景的共同心法**：**先 `view`/`trace` 看清状态与日志 → 再 `verify`/`status` 分清"runner 问题还是 job 问题" → 最后才是改 yaml 或 retry**。
+
+---
+
 ## 4. 逐字段表
 
 ### 4.1 job 关键字表

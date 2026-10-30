@@ -910,6 +910,125 @@ build:
 
 ---
 
+## 3.5 常用运维命令面板（按场景）
+
+> **本节能做什么**：3.3 是"一条标准构建流水线"，本节是**每天值班 / 面试都会敲的构建与制品运维命令**——Runner 排查、Docker 构建、Maven 多模块、Harbor 清理都在这。**CI 构建侧的肌肉记忆就来自这一张表。**
+
+### ① Runner 注册与节点离线处理
+
+```bash
+gitlab-runner register                          # 交互注册（URL / token / executor / tag）
+gitlab-runner verify                            # 校验 runner 能连 GitLab（心跳）
+gitlab-runner status                            # 进程在不在、是否 active
+gitlab-runner list                              # 本机所有 runner 及状态
+sudo gitlab-runner restart                      # 节点抽风先重启服务
+# Docker executor 的 job 容器卡住时清场：
+docker ps -a | grep runner-                     # 看 runner 拉起来的临时构建容器
+docker rm -f $(docker ps -a -q -f name=runner-) # 强清卡死的构建容器（慎用）
+```
+
+> **实战价值**：`verify` 通说明 runner↔GitLab 链路正常，问题在 job；不通就是 **token 过期 / 网络 / 服务挂**。`docker rm -f` 清的是卡死的构建容器——当 job 异常退出没清理时，这些容器会吃满磁盘，是"runner 节点磁盘爆"的常见元凶。
+
+### ② Docker 镜像构建运维
+
+```bash
+docker build -t registry/app:$(git rev-parse --short HEAD) .   # 用 commit SHA 打 tag（可追溯，别用 latest）
+docker build --target runtime -t app:prod .                    # 多阶段构建：只取最终阶段
+docker build --cache-from app:prev -t app:new .                # 拉上一版镜像当缓存层，加速 CI 构建
+docker pull registry/app:tag                                   # 拉镜像
+docker push registry/app:tag                                   # 推镜像
+docker images prune -f                                         # 清悬空镜像（<none>）
+docker builder prune -f                                        # 清构建缓存（buildkit cache）
+docker system df                                               # 看镜像/容器/缓存各占多少空间
+```
+
+> **实战价值**：**多阶段构建是面试必考点**——把编译环境和运行环境分开，最终镜像只有 runtime 层，体积能小一个数量级。`docker system df` 是判断"节点磁盘是不是被镜像堆爆"的第一步；CI 节点要定时 `prune`，否则跑几十条流水线就满盘。
+
+### ③ Maven 多模块构建
+
+```bash
+mvn clean package                              # 全量构建+打包（最常用）
+mvn clean package -pl user-service -am         # 只构建 user-service 及其依赖模块（-am = also make）
+mvn clean package -DskipTests                  # 跳过测试（CI 里测试另起 job 时省时间）
+mvn dependency:tree                            # 看依赖树，定位依赖冲突/重复引入
+mvn -o clean package                           # 离线模式（构建机无外网或代理故障时）
+mvn help:effective-pom                         # 看最终生效的 pom（被 parent/profile 覆盖后长啥样）
+```
+
+> **实战价值**：**`-pl -am` 是多模块项目的救星**——只构建改动的那一个模块及其上游依赖，CI 时间从几十分钟降到几分钟。`dependency:tree` 定位 `NoSuchMethodError` / 版本冲突的根因（同一个包被两个版本引入）。**面试常问"大仓里怎么只构建改动的模块"。**
+
+### ④ 制品仓库 Harbor（登录 / 打标 / 清理）
+
+```bash
+docker login registry.example.com -u <user>    # 登录 Harbor
+docker logout registry.example.com             # 退出（CI 结束要 logout，别留凭据）
+docker tag app:local registry.example.com/lib/app:1.2.3   # 打 Harbor 全路径 tag
+docker push registry.example.com/lib/app:1.2.3            # 推到项目仓库
+# 清理策略（Harbor 自身不会自动删旧镜像）：
+# 网页 → 项目 → 标签保留策略：按数量/天数保留最近 N 个，老的自动清理
+# 或手动删：网页勾选过期 tag；底层再跑 GC 回收空间
+docker exec -it harbor-core gc                                  # Harbor 垃圾回收（删未被引用的层）
+```
+
+> **实战价值**：**Harbor 不会因为你 push 了新镜像就自动删旧的**——不配保留策略，registry 磁盘迟早爆。标签用 **语义化版本 + commit SHA**，配合 Harbor 的"标签保留策略"做自动清理，是生产标配。`gc` 是回收被删 tag 后真正占着的存储层，删了 tag 不 gc 空间不释放。
+
+### ⑤ Jenkins（另一主流 CI 引擎的运维命令）
+
+```bash
+java -jar jenkins-cli.jar -s http://jenkins:8080/ help        # 看 CLI 支持哪些命令
+java -jar jenkins-cli.jar -s http://jenkins:8080/ list-jobs   # 列出所有 job
+java -jar jenkins-cli.jar -s http://jenkins:8080/ console <job> # 拿某次构建的控制台输出
+# Groovy 控制台（网页 → Manage Jenkins → Script Console）做批量运维：
+#   println Jenkins.instance.nodes*.name          # 列出所有节点
+#   Jenkins.instance.getNode("agent-1").toComputer().offline  # 看节点是否离线
+tail -f /var/log/jenkins/jenkins.log                            # 排障第一现场
+```
+
+> **实战价值**：Jenkins CLI + Groovy console 是**不用点网页就能批量管 job 和节点**的利器——比如批量改 job 配置、下线故障节点。`/var/log/jenkins/jenkins.log` 是插件报错、节点掉线的第一现场；**节点离线**先看日志里是不是 agent 连不上 master（JNLP 端口/凭据），再看 agent 机器本身是不是磁盘满/进程死。
+
+---
+
+## 3.6 构建与制品排障实战（3 个场景串命令）
+
+> **把 3.5 的命令用起来**：三个最典型的构建侧故障，按"现象 → 敲的命令 → 怎么读"走一遍。**在测试 runner / 测试仓库上练。**
+
+### 场景 A：runner 节点离线，job 全 pending
+
+```bash
+gitlab-runner status                            # 现象：runner 进程不在 / 非 active
+gitlab-runner verify                            # 能连 GitLab 吗？报错=token/网络
+sudo systemctl restart gitlab-runner            # 重启服务
+docker system df                                # 顺手看是不是磁盘爆导致 runner 起不来
+```
+
+> **读法**：`verify` 不通先重启服务；重启还不行看磁盘（`docker system df`）——**构建容器没清会吃满盘，runner 直接起不来**。Jenkins 侧则看 `/var/log/jenkins/jenkins.log` 里 agent 掉线的原因。
+
+### 场景 B：镜像越堆越多，节点磁盘 100%
+
+```bash
+docker system df                                # 现象：镜像/缓存占用爆表
+docker images prune -f                          # 清悬空镜像
+docker builder prune -f                         # 清 buildkit 构建缓存
+# 查是谁在产镜像：
+docker images --format '{{.Repository}} {{.Size}}' | sort -k2 -h
+```
+
+> **读法**：CI 节点必须**定时 prune**（写进 cron 或放在流水线收尾）。`docker system df` 先确认是镜像还是缓存占大头，再针对性清；清完不释放空间还要查是不是有容器还引用着这些层。
+
+### 场景 C：多模块大仓构建太慢 / 依赖冲突
+
+```bash
+mvn clean package -pl user-service -am -DskipTests   # 只构建改动模块+依赖
+mvn dependency:tree | grep conflict                 # 看冲突的依赖
+mvn help:effective-pom > eff.xml                    # 导出最终 pom 排查被覆盖的配置
+```
+
+> **读法**：全量构建慢 → 用 `-pl -am` 缩小范围；`NoSuchMethodError` 类报错 → `dependency:tree` 找同包多版本；CI 里测试另起 job 时加 `-DskipTests` 省一遍测试时间。
+
+> **三个场景的共同心法**：**先 `status`/`verify`/`df` 看清"是节点挂了还是磁盘爆了还是构建本身慢" → 再对症下药（重启 / prune / 缩小构建范围）→ 最后才是改流水线配置。**
+
+---
+
 ## 4. 逐字段表
 
 ### 4.1 runner 关键配置表

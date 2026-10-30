@@ -1,5 +1,67 @@
 # L4 · ArgoCD 安装与同步（装起来 → 看懂 diff → 会同步）
 
+---
+
+### 3.5 常用运维命令（Argo CD 日常运维 + GitOps 排障，按场景）
+
+> **本节能做什么**：3.1–3.4 是"把 Argo CD 装上、把 Application 建起来同步成功"，本节是**每天值班敲的 Argo CD CLI 命令 + GitOps 排障套路**——从看状态、手动同步、回滚到集群/仓库管理，以及另一条 GitOps 路线 Flux 的对照命令。配置管理 / DevOps 岗的 GitOps 肌肉记忆就来自这一张表。
+> **环境基准**：本机实测 `argocd v2.11.x` + `flux v2.3.x`。CLI 默认已 `argocd login` 到控制面。
+
+#### ① Application 日常运维（app list / get / sync / logs / diff / rollback）
+
+```bash
+argocd app list                                  # 看所有 Application 的同步/健康状态（值班第一眼）
+argocd app get guestbook                         # 看单个 app 的树状资源、同步状态、健康
+argocd app sync guestbook                        # 手动触发一次同步（Git 已改但没自动同步时）
+argocd app sync guestbook --prune                # 同步并清理 Git 里已删除的孤儿资源
+argocd app diff guestbook                        # 预览 Git 期望 vs 集群实际会改什么（不动手）
+argocd app logs guestbook                        # 看 Argo CD 对这个 app 的同步日志
+argocd app rollback guestbook <REVISION>         # 回滚到某次 Git 提交对应的版本（救火第一招）
+argocd app terminate-op guestbook                # 卡死的同步操作强制终止
+```
+
+> **实战价值**：`app list` 是值班时一眼看全集群哪些 app 飘红；`diff` 在手动同步前先确认"到底会变什么"，比盲 `sync` 安全；`rollback` 到历史 Git revision 是 GitOps 相比手工 kubectl 的最大优势——**每次发布都有 Git commit 可追溯、可回退**。
+
+#### ② 集群与仓库管理（cluster / repo）
+
+```bash
+argocd cluster add <kubecontext>                 # 把另一个 kube-context 注册进 Argo CD
+argocd cluster list                              # 看已纳管的所有集群
+argocd cluster get <CLUSTER_URL>                 # 看某个集群的详细信息/状态
+argocd repo add https://github.com/xxx/gitops.git --username xxx --password xxx   # 加 Git 仓库凭证
+argocd repo list                                 # 看已配置的仓库及其连接状态
+argocd repo get <REPO_URL>                       # 看单个仓库的认证/健康检查
+argocd app create ... --dest-server <CLUSTER_URL> # 把 app 部署到指定集群（多集群关键）
+```
+
+> **实战价值**：`cluster add` + `app --dest-server` 是多集群 GitOps 的标准动作；`repo list` 里仓库若 `Connection Status: Failed`，所有指向它的 app 都会 `Unknown`，是"为什么突然全飘红"的第一排查点。
+
+#### ③ GitOps 排障（同步失败 / drift 检测）
+
+```bash
+argocd app get guestbook -o yaml                 # 拿完整状态 YAML，看 status.operation.message 报错
+argocd app logs guestbook --since 1h             # 看最近 1 小时的同步日志
+kubectl -n guestbook scale deploy guestbook --replicas=5   # 故意手改副本数，制造 drift
+argocd app get guestbook                         # 状态变 OutOfSync（drift 被检出）
+argocd app sync guestbook --force                # 强制把 Git 期望推回集群（selfHeal 关闭时手动纠正）
+argocd app wait guestbook --health               # 等 app 健康，常用于流水线里卡同步完成
+```
+
+> **实战价值**：同步失败先看 `app get -o yaml` 的 `status.operation.message`，九成错误（镜像拉不到、RBAC 不足、字段非法）写在那里，别盲猜。drift 是 GitOps 的命门：集群被手改后，要么 `selfHeal` 自动纠回 Git 期望，要么靠 `app sync --force` 手动纠——这正是"声明即真相"的体现，面试必问。
+
+#### ④ 对照：Flux 路线（flux get / check / reconcile / suspend / resume）
+
+```bash
+flux get kustomizations                         # 看所有 Kustomization 的就绪/最后应用时间
+flux get sources git                            # 看 GitRepository 源同步状态
+flux check                                      # 一键自检：控制器/CRD/网络连通是否都健康
+flux reconcile kustomization my-app --with-source   # 手动触发一次调和（等价于 Argo 的 sync）
+flux suspend kustomization my-app               # 暂停自动调和（维护/排障时）
+flux resume kustomization my-app                # 恢复自动调和
+```
+
+> **实战价值**：Flux 与 Argo CD 是 GitOps 两大实现，面试常让对比。Flux 走"控制器自动 reconcile"模型，`suspend`/`resume` 是临时冻结节点的手段；`flux check` 是排查"为什么都不动了"的入口。同一套 Git 仓库，两套引擎命令风格不同，但核心都是"Git 期望 ↔ 集群实际"的自动闭环。
+
 > **本篇定位**：GitOps 交付篇的第一篇。前面 L1/L2/L3 把 Helm 和 Terraform 的能力铺好了，这篇讲**怎么让集群自己从 Git 里拿配置并对齐**。
 > **前置**：L2 K8s 架构与对象模型（必须理解 CRD、controller、期望态/实际态三态模型）、L1 Docker（镜像地址与拉取）、本目录 [`L1-Helm-模板化封装`](L1-Helm-模板化封装.md)（Helm 渲染出来的就是 ArgoCD 要同步的东西）。
 > **学完能做什么**：讲清 GitOps 的"拉模型"和传统 CI/CD "推模型"的安全差异；说清 Application / AppProject / Repository / Cluster / ApplicationSet 五个对象各管什么；在 kind 集群装起 ArgoCD、添加私有仓库、建 Application、**看懂 diff 再同步**；解释 Healthy / Progressing / Degraded / Missing / Suspended / Unknown 六个健康状态。

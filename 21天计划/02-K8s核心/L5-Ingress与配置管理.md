@@ -1110,4 +1110,55 @@ kubectl get secret day2-db2 -o yaml | grep -A2 'data:'
 
 ---
 
+## 9. 常用运维命令（Ingress / 配置管理排障速查）
+
+> **本节能做什么**：L5 讲 Ingress 路由与 ConfigMap/Secret 注入，本节把**这两块日常排障命令**按场景归类——Ingress 与网关后端校验、ConfigMap/Secret 核查、端口转发本地验证，以及"404/502"实战排障。**Ingress 的真相都在 Ingress Controller 的日志里。**
+
+### ① Ingress 与网关后端校验
+
+```bash
+kubectl get ingress -n prod -o wide                   # 看 HOSTS / ADDRESS / 端口
+kubectl describe ingress web -n prod                  # 看 Rules / 后端 Service / Events / ADDRESS
+kubectl get ingressclass                              # 看集群有哪些 Ingress Controller
+kubectl -n ingress-nginx get pods                     # Ingress Controller 本身是否健康
+kubectl -n ingress-nginx logs deploy/ingress-nginx-controller --tail=100   # 看路由翻译/报错
+```
+
+> **实战价值**：Ingress 不通先分两类——`ADDRESS` 为空 = Controller 没接管（Pod 没起/没配对）；`ADDRESS` 有但 502 = 后端 Service 无端点；404 = host/path 没匹配上。Controller 日志是判因第一现场。
+
+### ② ConfigMap / Secret 核查
+
+```bash
+kubectl get cm,secret -n prod                        # 列配置与敏感数据
+kubectl get cm app-config -n prod -o yaml            # 看具体配置值
+kubectl get secret app-secret -n prod -o jsonpath='{.data}'   # data 是 base64，不是加密！
+kubectl describe cm app-config -n prod               # 看键名（不打印大值，安全）
+kubectl exec <pod> -n prod -- env | grep -i APP_     # 看 env 注入是否生效
+kubectl exec <pod> -n prod -- cat /etc/config/app.conf   # 看 volume 挂载内容
+```
+
+> **实战价值**：**base64 不是加密**——Secret 放进 etcd 默认明文，生产要开加密或上外部密钥管理；env 注入**不热更新**、volume 挂载**会更新（有延迟）**、`subPath` 挂载**不更新**，改配置后"为什么没生效"多半是这三条记混了。
+
+### ③ 端口转发本地验证 Ingress
+
+```bash
+kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 8080:80   # 把网关映射到本地
+curl -H "Host: web.example.com" http://127.0.0.1:8080/   # 带 Host 头模拟外部访问
+```
+
+> **实战价值**：把 Ingress Controller 端口转发到本地，用 `curl -H Host` 绕过外部 DNS/LB 直接验证路由规则本身是否正确，是定位"Ingress 规则错还是外部链路错"的关键一步。
+
+### ④ 排障实战：访问 Ingress 报 404 / 502
+
+```bash
+kubectl describe ingress web -n prod         # host/path 匹配？backend Service 存在且对？
+kubectl get endpoints <backend-svc> -n prod  # 后端有就绪端点吗？
+kubectl -n ingress-nginx logs deploy/ingress-nginx-controller --tail=50   # 看拒绝了什么请求
+# 404 → 路由没匹配（host/path 写错）；502 → 后端无端点或应用未监听
+```
+
+> **读法**：404 是"规则层没匹配上"（host/path/IngressClass），502 是"匹配上了但后端接不住"（端点空/应用没起）。两者根因完全不同，先看 `describe ingress` 的 backend 再进 Controller 日志。
+
+---
+
 **下一篇**：[`L6-存储PV与PVC`](L6-存储PV与PVC.md)（**从 hostPath 到 StorageClass 的演进 · PV 与 PVC 的绑定 · 访问模式与回收策略 · StatefulSet 的 volumeClaimTemplates · CSI**） · **上一篇**：[`L4-Service与网络`](L4-Service与网络.md) · **上一级**：[`00-学习地图与前置依赖`](../00-学习地图与前置依赖.md)

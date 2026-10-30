@@ -40,7 +40,9 @@ L5 Alertmanager 与 OpenTelemetry
 │   ├─ 3.1 一份最小可用的 Alertmanager 配置
 │   ├─ 3.2 造一次告警风暴，看分组与抑制的效果
 │   ├─ 3.3 写一份可执行的告警规则（annotations 模板）
-│   └─ 3.4 Collector 的最小配置
+│   ├─ 3.4 Collector 的最小配置
+│   ├─ 3.5 常用运维命令（按场景）
+│   └─ 3.6 运维排障实战（场景串命令）
 │
 ├─ 4. 逐字段表
 │   ├─ 4.1 Alertmanager route / inhibit / silence 配置项表
@@ -1442,6 +1444,122 @@ service:
 
 > ⚠️ **`memory_limiter` 放最前、`batch` 放最后**——这是社区与官方文档一致的实践：**限流器必须第一个看到数据才能保护后面的组件；批处理器必须最后聚合才能减少网络往返**。
 > ⚠️ **`transform` 里的 `error_mode: ignore` 很重要**：**默认的 `error_mode` 会在转换出错时丢弃整批数据**——**脱敏规则写错一条，就可能把一整批遥测干掉**。生产上用 `ignore` 更安全。
+
+---
+
+### 3.5 常用运维命令（按场景）
+
+> **本节能做什么**：3.1–3.4 是"把告警管道和 Collector 配起来"，本节是**Alertmanager 配置校验、告警查看/静默、路由验证，以及 OTel Collector 健康检查**的运维命令——按场景归类，每条配真实例子。**告警排障的肌肉记忆就来自这一张表。**
+
+### ① Alertmanager 配置校验（改完先过这一关）
+
+```bash
+amtool check-config /etc/alertmanager/alertmanager.yml     # 校验主配置（route / receiver / inhibit）
+amtool config routes test --config.file /etc/alertmanager/alertmanager.yml \
+  --label=severity=critical --label=service=order          # 拿一条假告警测它会走哪条路由
+promtool check rules /etc/prometheus/rules/*.yml           # 顺带校验上游 Prometheus 规则
+```
+
+> **实战价值**：`amtool check-config` 能在 reload 前挡掉 route 写错、receiver 引用不存在这类事故；`amtool config routes test` 是**"这条告警到底发给谁"的模拟器**——面试被问"怎么验证路由配置对不对"就答这个。比 reload 后等真告警划算太多。
+
+### ② 告警查看与静默（值班救火日常）
+
+```bash
+amtool alert query --alertmanager.url=http://localhost:9093        # 看当前 active 告警（含 label）
+amtool silence add alertname=Watchdog --duration=2h --comment="维护窗口"   # 加静默（维护期免打扰）
+amtool silence query --alertmanager.url=http://localhost:9093      # 看现有静默
+amtool silence expire <silence-id>                                 # 提前结束静默
+amtool alert query --inhibited                                     # 看被抑制的告警
+```
+
+> **实战价值**：`amtool silence add` 是**维护窗口的标准操作**——屏蔽已知抖动，避免告警疲劳（§2.10）；`amtool alert query` 直接看告警有没有进来、label 对不对，是"告警没收到"排查的第一入口。**别在 UI 点，命令行可脚本化、可进 runbook。**
+
+### ③ 路由与分组验证（为什么没发给对的人）
+
+```bash
+amtool config routes --alertmanager.url=http://localhost:9093      # 看路由树
+amtool config routes test --label=severity=critical --label=team=db   # 模拟某标签组合走到哪个 receiver
+amtool config receivers --alertmanager.url=http://localhost:9093   # 看 receiver 列表
+```
+
+> **实战价值**：告警"发错人/没发"先查路由——`amtool config routes test` 用真实标签模拟，能直接告诉你它匹配到哪条 route、哪个 receiver。**路由树配错是告警投递失败的第一大原因**（§2.2 匹配顺序）。
+
+### ④ Alertmanager API（不用 UI 也能查一切）
+
+```bash
+curl -s http://localhost:9093/api/v2/alerts | head -c 600        # 看当前告警（等价于 amtool alert query）
+curl -s http://localhost:9093/api/v2/silences | head -c 600      # 看静默
+curl -s http://localhost:9093/-/ready                            # 健康探针
+curl -X POST http://localhost:9093/-/reload                      # 改完配置热加载（需 --web.enable-lifecycle）
+```
+
+> **实战价值**：`/api/v2/alerts` 和 `/api/v2/silences` 是 amtool 的底层接口，**脚本化、接自愈系统都靠它**；`/-/reload` 改配置不重启的唯一安全路径，但**必须启动时带 `--web.enable-lifecycle`**，否则 404（和 Prometheus 一样）。
+
+### ⑤ OpenTelemetry Collector 运维（pipeline 健康检查）
+
+```bash
+otelcol --config=/etc/otel/config.yaml --dry-run     # 校验 pipeline 配置（components 引用、顺序）
+curl -s http://localhost:13133/health/check          # 健康检查（默认 ppor/health_check 扩展）
+curl -s http://localhost:8889/metrics | grep -E 'otelcol_(exporter|receiver)_'  # 自身指标：吞吐/报错
+ss -ltnp | grep -E '4317|4318|8889|13133'             # OTLP gRPC/HTTP 与扩展端口
+journalctl -u otelcol -n 100 --no-pager               # 看启动与 pipeline 报错
+```
+
+> **实战价值**：Collector 起不来，先看 `--dry-run` 校验 pipeline（receiver→processor→exporter 引用是否齐全、顺序是否 `memory_limiter` 在前 `batch` 在后，§3.4）；`/health/check` 接探针；`/metrics` 看 exporter 有没有在 flush、receiver 有没有在收。**OTel 排障第一原则是"先确认 pipeline 校验过"。**
+
+### ⑥ 通用：进程、端口、配置校验
+
+```bash
+ps aux | grep -E 'alertmanager|otelcol' | grep -v grep   # 进程与启动参数
+ss -ltnp | grep -E '9093|9094|13133|8889'                # AM 端口 + OTel 端口
+amtool check-config /etc/alertmanager/alertmanager.yml   # AM 改动前的第一道闸
+otelcol --config=/etc/otel/config.yaml --dry-run         # OTel 改动前的第一道闸
+```
+
+> **实战价值**：两个组件都有"配置校验优先于 reload"的纪律——`amtool check-config` 和 `otelcol --dry-run` 是各自的安全带，比救火便宜。
+
+---
+
+### 3.6 运维排障实战（场景串命令）
+
+> **把 3.5 的命令用起来**：三个最典型的告警/链路故障，按"现象 → 敲的命令 → 怎么读"走一遍。**建议在本地 Prometheus + Alertmanager + OTel 测试链路上练。**
+
+### 场景 A：Prometheus 触发了告警，但人没收到通知
+
+```bash
+amtool alert query --alertmanager.url=http://localhost:9093        # 告警进 AM 了没？label 对不对？
+amtool config routes test --label=alertname=HighErrorRate --label=severity=critical  # 它该走哪条路由？
+amtool silence query                                               # 是不是被静默了
+curl -s http://localhost:9093/api/v2/silences | grep -i 'startsAt\|endsAt'  # 静默时间窗
+# 典型：路由没匹配到 receiver / 被一条宽静默吞了 / inhibit_rules 抑制了
+```
+
+> **读法**：收不到通知，**先确认告警进没进 AM**（`amtool alert query`），再 `config routes test` 看它路由到哪、有没有被静默/抑制（§2.4 / 2.5）。90% 的"漏通知"是路由树配错或静默忘了清，不是邮件/webhook 挂了。
+
+### 场景 B：告警风暴 / 同一条告警刷屏（没分组）
+
+```bash
+amtool alert query --alertmanager.url=http://localhost:9093 | wc -l        # 告警数量
+amtool config routes --alertmanager.url=http://localhost:9093              # 看 group_by 配了没
+curl -s http://localhost:9093/api/v2/alerts | grep -o '"fingerprint":"[a-f0-9]*"' | sort -u | wc -l  # 去重后多少条
+# 典型：group_by 只按 alertname，没按 instance → 每台机器各发一封
+```
+
+> **读法**：告警刷屏 = 分组维度太粗或没分组（§2.3）。看 `group_by` 配了哪些标签——按 `instance`/`pod` 分才能把"同一类故障的不同实例"归成一封。**这是告警疲劳（§2.10）的直接制造者，也是面试高频题。**
+
+### 场景 C：Collector 起不来 / 数据没出去（OTel pipeline）
+
+```bash
+otelcol --config=/etc/otel/config.yaml --dry-run        # 先校验 pipeline
+journalctl -u otelcol -n 50 --no-pager                  # 看启动报错（component 引用错/顺序错）
+curl -s http://localhost:8889/metrics | grep -E 'otelcol_exporter_sent|otelcol_exporter_send_failed'  # 发出去没
+ss -ltnp | grep -E '4317|4318'                          # OTLP 端口在不在
+# 典型：pipeline 里 receiver 名拼错 / memory_limiter 没放最前 / 后端地址不可达
+```
+
+> **读法**：Collector 没数据，**先看 `--dry-run` 校验 pipeline 引用是否齐全**；再看 `/metrics` 的 `exporter_sent` vs `exporter_send_failed` 确认"收了没、发出去没"。`memory_limiter` 没放最前会直接 OOM（§3.4 纪律），这是最常见的启动即崩原因。
+
+> **三个场景的共同心法**：**告警问题先定位"在 AM 内还是 AM 外"**——`amtool alert query` 是分水岭；**OTel 问题先 `--dry-run` 校验 pipeline**。两者都印证"配置校验优先于 reload"的运维纪律。
 
 ---
 

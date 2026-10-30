@@ -360,6 +360,135 @@ kubectl run dns-test --rm -it --restart=Never --image=busybox:1.36 -- sh -c \
 
 ---
 
+## 4.4 常用运维命令面板（按场景）
+
+> **本节能做什么**：前面 4.1–4.3 是"速查表"，本节是**每天值班 / 面试都会敲的 Linux 与网络排障命令**——按场景归类，每条配真实例子。**基础运维的肌肉记忆就来自这一张张表。**
+
+### ① 文件与权限排查
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `ls -l` | `ls -lh /var/log` | 一眼看权限 / 属主 / 大小，定位"权限拒绝"第一步 |
+| `stat` | `stat app.log` | 看 inode、大小、三个时间戳，区分"改过没"与"动过没" |
+| `chmod` | `chmod 644 file` / `chmod +x deploy.sh` | 修脚本不可执行、文件误 777 等高频事故 |
+| `chown` | `chown -R app:app /data` | 容器挂载目录属主错导致写不进，先查这个 |
+| `find` | `find / -name "*.conf" 2>/dev/null` | 全机找配置文件，绕过"忘了放哪" |
+| `file` | `file unknown_bin` | 判文件真实类型，防"看着像文本其实是二进制"的误判 |
+
+### ② 进程与资源占用
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `ps` | `ps aux --sort=-%mem \| head` | 按内存排序找吃内存的进程 |
+| `top` / `htop` | `top -p $(pidof java)` | 实时看 CPU / 内存，htop 还能树状看父子进程 |
+| `kill` / `pkill` | `pkill -f "python.*worker"` | 按名字批量杀，发布前停旧进程常用 |
+| `nice` / `renice` | `nice -n 10 tar ...` | 给打包类后台任务降优先级，别抢在线服务 CPU |
+| `pgrep` | `pgrep -a nginx` | 只看匹配进程，脚本里判断"服务起了没" |
+
+### ③ 磁盘、inode 与文件句柄
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `df -h` | `df -h /` | 看挂载点剩余，**`No space left` 第一反应** |
+| `du -sh` | `du -sh /var/* \| sort -h` | 逐层找大目录，定位"谁把盘写满" |
+| `df -i` | `df -i /` | 磁盘没满但写不进？多半是 **inode 耗尽**（小文件太多） |
+| `lsof +L1` | `lsof +L1` | 找"已删除但仍被进程占用"的文件，**这是 df 满而 du 找不到凶手的根源** |
+| `lsof -p` | `lsof -p <pid>` | 看某进程打开了哪些文件 / 端口，排"文件句柄泄漏" |
+
+> **实战价值**：`df` 说满、`du` 找不到 → 八成是 deleted 文件还被进程握着。别急着 rm（删了也不释放），先 `lsof +L1` 定位持有进程。
+
+### ④ 文本处理三剑客（排障取数）
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `grep` | `grep -i error app.log \| tail -50` | 从海量日志捞错误，面试必考组合 |
+| `awk` | `awk '{print $1}' access.log \| sort \| uniq -c \| sort -nr \| head` | 统计访问 IP TopN，定位异常流量 |
+| `sed` | `sed -n '100,200p' huge.log` | 看大文件指定行区间，不把内存吃爆 |
+| `cut` | `docker ps \| cut -c1-20` | 只取某几列，配合管道做脚本 |
+| `sort`/`uniq` | `... \| sort \| uniq -c` | 去重计数，日志聚合标配 |
+
+### ⑤ 网络排查（端口 / 连通 / DNS）
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `ping` | `ping -c 4 10.0.0.1` | 验二层 / 三层连通，先确认"通不通" |
+| `traceroute` | `traceroute -n api.xxx.com` | 看哪一跳丢包，定位跨机房 / 跨境问题 |
+| `curl` | `curl -sS -m 5 -o /dev/null -w '%{http_code} %{time_total}\n' http://svc` | 测 HTTP 可用性与耗时，**比浏览器可靠，可入脚本** |
+| `ss` | `ss -lntp \| grep :8080` | 看谁占了 8080，**替代已废弃的 netstat** |
+| `lsof -i` | `lsof -i :8080` | 按端口反查进程，和 ss 交叉验证 |
+| `dig`/`nslookup` | `dig +short A svc.cluster.local` | 查 DNS 解析结果，区分"解析失败"还是"服务挂了" |
+| `tcpdump` | `tcpdump -i any -n port 3306 -c 100` | 抓包看请求到底发出去没，终极排障手段 |
+
+### ⑥ Shell 组合与退出码（把命令串成排障流水线）
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `&&` / `\|\|` | `ping -c1 host && echo up \|\| echo down` | 连通才继续，脚本里做前置校验 |
+| `xargs` | `docker ps -q \| xargs docker rm -f` | 把上一条输出当参数批量执行 |
+| `$?` | `echo $?` | 看上条命令退出码，**0 成功 / 非 0 失败**，CI 判成败的依据 |
+| `tee` | `cmd 2>&1 \| tee run.log` | 既看屏幕又留日志，事后复盘 |
+| 管道组合 | `kubectl get pods -A \| grep -E 'Evicted\|Error'` | 跨命名空间扫异常，基础篇打通到 K8s 的桥梁 |
+
+### ⑦ 系统状态速查
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `uptime` | `uptime` | 看负载（load average），1 / 5 / 15 分钟 |
+| `free -h` | `free -h` | 看内存与 swap，OOM 前先确认 |
+| `vmstat` | `vmstat 1` | 看 CPU / IO / 内存瓶颈在哪 |
+| `dmesg` | `dmesg -T \| tail` | 看内核日志，OOM Killer、磁盘掉线都写这 |
+| `journalctl` | `journalctl -u docker -n 100 --no-pager` | 看 systemd 托管服务的日志，替代看 /var/log |
+
+### ⑧ YAML 快速校验（避免把错配置送上集群）
+
+| 命令 | 实例 | 实战价值 |
+|---|---|---|
+| `python -c` | `python -c "import yaml,sys; yaml.safe_load(open('x.yaml'))"` | 一行校验 YAML 语法，**上线前最后一道** |
+| `yamllint` | `yamllint x.yaml` | 查缩进 / 引号等风格问题，CI 可集成 |
+| `kubectl --dry-run=client` | `kubectl apply -f x.yaml --dry-run=client` | 客户端校验，不真正提交（L1 细讲） |
+
+---
+
+## 4.5 入门排障实战（3 个场景串命令）
+
+> **把 4.4 的命令用起来**：三个最典型的基础故障，按"现象 → 敲的命令 → 怎么读"走一遍。**都在本地练，别在真机试。**
+
+### 场景 A：磁盘被写满（应用突然写不进日志）
+
+```bash
+df -h /                      # 现象：Use% = 100%
+du -sh /var/* | sort -h      # 逐层找大目录
+lsof +L1 | grep deleted      # 凶手可能是"已删但进程还占着"的日志
+# 看到 deleted 的大文件 → 重启对应进程释放，或 truncate 清空
+```
+
+> **读法**：df 说满、du 找不到 → 八成是 deleted 文件。别急着 rm（删了也不释放），先 `lsof +L1` 定位持有进程，truncate 或重启它。
+
+### 场景 B：端口被占用（服务起不来，报 address already in use）
+
+```bash
+ss -lntp | grep :8080        # 看谁占着 8080
+lsof -i :8080                # 交叉确认
+kill -9 <pid>                # 杀掉旧进程（确认不是别的服务！）
+```
+
+> **读法**：`address already in use` 不是配置错，是端口冲突。`ss`/`lsof` 反查 PID，确认是残留旧进程再杀，别误杀在线服务。
+
+### 场景 C：服务网络不通（本地 curl 超时）
+
+```bash
+ping -c4 <ip>                # 先确认三层通
+curl -sS -m5 -v http://ip:port   # -v 看 TLS/连接卡在哪一步
+ss -tnp | grep <port>        # 看本机有没有在监听
+dig +short <域名>            # 解析有没有返回 IP
+```
+
+> **读法**：分层定位——ping 通不通 → 端口监听没 → DNS 解析没 → curl -v 卡在哪。一层层排除，别一上来就改配置。
+
+> **三个场景的共同心法**：**先看状态（df/ss/ping）→ 再定位原因（du/lsof/curl -v）→ 最后才动**。基础篇的排障和 K8s 篇心法一致：别猜，看证据。
+
+---
+
 ## 5. 横向对比
 
 | 问题 | 方案 A | 方案 B | 怎么选 |

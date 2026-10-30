@@ -989,6 +989,63 @@ spec:
 
 ---
 
+### 3.6 常用运维命令（Argo Rollouts 渐进式交付，按场景）
+
+> **本节能做什么**：3.1–3.5 是"装 controller、跑金丝雀、放行/中止、接 Analysis"，本节是**做渐进式交付时每天敲的 Rollouts CLI 命令**——从看发布进度、手动放行/中止、调权重到分析判定与排障。这是配置管理岗在"零停机发布"场景下的实战面板。
+> **环境基准**：本机实测 `kubectl-argo-rollouts v1.6.x`（插件式子命令 `kubectl argo rollouts`）。
+
+#### ① Rollout 生命周期（get / promote / abort / pause / resume / restart）
+
+```bash
+kubectl argo rollouts get rollout rollouts-demo        # 看当前发布阶段、权重、两个 RS 状态
+kubectl argo rollouts list                              # 看命名空间下所有 Rollout
+kubectl argo rollouts promote rollouts-demo            # 放行：从当前步推进到下一阶段（金丝雀加流量）
+kubectl argo rollouts abort rollouts-demo              # 中止：流量回退到 stable，权重归零（救火）
+kubectl argo rollouts pause rollouts-demo              # 暂停在当前步（卡住人工确认点）
+kubectl argo rollouts resume rollouts-demo             # 解除暂停，继续自动推进
+kubectl argo rollouts restart rollouts-demo            # 触发一次全新的 Rollout（重启发布流程）
+```
+
+> **实战价值**：`promote` 是金丝雀"看着指标没问题，再放一点"的手动开关；`abort` 是发布翻车时的第一反应——比回滚 Deployment 更优雅，它直接把流量切回 stable。`pause`/`resume` 实现"自动化 + 人工卡点"的混合发布，是生产灰度常见姿势。
+
+#### ② 流量与权重（set weight / abort / undo）
+
+```bash
+kubectl argo rollouts set weight rollouts-demo 30     # 手动把金丝雀流量权重设为 30%
+kubectl argo rollouts set weight rollouts-demo 100    # 一步全量（跳过剩余步骤，谨慎）
+kubectl argo rollouts abort rollouts-demo             # 异常时直接回退 stable
+kubectl argo rollouts undo rollouts-demo              # 回滚到上一个稳定 ReplicaSet
+kubectl argo rollouts get rollout rollouts-demo -o yaml | grep -i weight   # 确认当前权重
+```
+
+> **实战价值**：`set weight` 在不依赖 Analysis 自动判定时，给你"手动控流量"的能力（适合小流量试水）。`undo` 与 `abort` 区别：`undo` 是切到上一个 RS（可能仍是金丝雀旧版），`abort` 是明确回 stable——救火时优先 `abort`。
+
+#### ③ 分析判定（analysis / abort）
+
+```bash
+kubectl get analysisrun -o wide                       # 看所有 AnalysisRun 的判定结果
+kubectl argo rollouts get rollout rollouts-demo       # 看 rollout 关联的 Analysis 状态
+kubectl argo rollouts abort rollouts-demo             # Analysis 判 Failed 时自动/手动中止
+kubectl logs -n argo-rollouts deploy/argo-rollouts                    # 看 controller 日志
+kubectl describe analysisrun <name>                   # 看某次分析的失败原因（指标/阈值）
+```
+
+> **实战价值**：Analysis 是"发布能不能继续"的自动守门员。它判 `Failed` 时 Rollout 会自动 `abort`——这是"指标不达标就自动停发"的精髓。排障先看 `describe analysisrun` 的失败指标（错误率、延迟、QPS），比肉眼盯 dashbord 靠谱。
+
+#### ④ 排障：卡在暂停 / 分析失败 / 流量不切
+
+```bash
+kubectl argo rollouts get rollout rollouts-demo       # 第一眼：卡在 Paused? Analysis 红? Weight 对?
+kubectl describe rollout rollouts-demo                # 看 status.conditions / message 报错
+kubectl get pods -l app=rollouts-demo -L rollouts-pod-template-hash   # 确认新旧两个 RS 的 Pod 都在
+kubectl argo rollouts abort rollouts-demo             # 发布翻车先回 stable
+kubectl argo rollouts restart rollouts-demo           # 想彻底重来一发新的 Rollout
+```
+
+> **实战价值**：发布"卡住不动"最常见两类——① `Paused` 等人工 `promote`（以为自动其实在等）；② Analysis 一直 `Inconclusive`（指标源没数据）。先看 `get`/`describe` 的状态字段，别急着删 RS。`abort` → 恢复 stable → 查因，是渐进式交付的通用救火顺序。
+
+---
+
 ## 4. 逐字段表
 
 ### 4.1 Canary steps 动作表

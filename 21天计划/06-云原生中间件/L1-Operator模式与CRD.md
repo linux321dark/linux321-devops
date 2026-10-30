@@ -890,6 +890,70 @@ kubectl apply -f my-crontab.yaml
 | 剪裁生效 | 写一个 schema 里没有的字段 | **apply 成功但字段消失** |
 | CRD 非结构化 | `kubectl get crd <name> -o yaml` 的 `status.conditions` | 不出现 `NonStructural` |
 
+### 3.7 常用运维命令面板（Operator / CRD 排障）
+
+> **本节能做什么**：3.1–3.6 让你"建出 CRD 和 CR"，本节补的是**日常和 Operator 打交道时真正会敲的运维命令**——查 CRD 是否就绪、看 CR 实际态、抓控制器日志、定位 reconcile 卡住。这些都用 `kubectl`，和前面 K8s 篇的排障思路一脉相承（本篇是概念篇，没有 Redis/PG 运行时，运维命令聚焦在 Operator/CRD 本身；Redis 与 PostgreSQL 的 `redis-cli`/`psql` 日常命令见 L2 §3.6）。
+
+#### ① 查 CRD 状态与 schema
+
+```bash
+kubectl get crd                                              # 所有 CRD，看是否 Established
+kubectl get crd crontabs.stable.example.com -o yaml          # 看 spec + status.conditions
+kubectl get crd <name> -o jsonpath='{.status.conditions}'    # 只看就绪状况
+kubectl api-resources | grep -i <kind>                       # CRD 是否注册进 API（能看到 = 端点建立）
+kubectl explain <kind>                                       # 看该 CR 的字段文档（不用背 schema）
+kubectl explain <kind>.spec.replicas                         # 看单个字段的含义与类型
+```
+
+> **实战价值**：`kubectl explain` 是"不确定 CR 字段怎么写"时的第一入口，**不查文档也能看字段语义**；`api-resources` 里找不到 = CRD 没建好或没注册，对应 3.5 的"装错顺序"故障。
+
+#### ② 查 CR 实际态（status 子资源）
+
+```bash
+kubectl get <kind> -A                        # 列出某 CR 的所有实例
+kubectl get <kind> <name> -o yaml           # 看 spec（期望态）+ status（实际态）
+kubectl get <kind> <name> -o jsonpath='{.status}'   # 只看控制器回报的实际态
+kubectl describe <kind> <name>              # 看 Events（控制器报错/进度都写这）
+kubectl get <kind> <name> -o wide           # 看 printerColumns 配置的速览列
+```
+
+> **实战价值**：Operator 的"实际态"在 `status`，不在 `spec`——**排障永远先看 `status` 和 `describe` 的 Events**。status 是空的 = 控制器没在 reconcile（权限不够 / 镜像没起来 / CRD 版本不匹配），这是 3.1 验证第 3 点的延伸。
+
+#### ③ 抓控制器日志（reconcile 真相）
+
+```bash
+kubectl get pods -n <operator-ns>                              # 找到控制器 Pod
+kubectl logs -n <operator-ns> deploy/<operator-name> -f        # 跟随日志看 reconcile 报错
+kubectl logs -n <operator-ns> deploy/<operator-name> --tail=200   # 最近 200 行
+kubectl logs -n <operator-ns> deploy/<operator-name> -p        # 看上一次崩溃的日志
+```
+
+> **实战价值**：控制器"没反应"或"反复 reconcile"时，**日志是唯一能告诉你它在想什么的东西**。看到 `permission denied` = RBAC 没给够；看到 `no kind is registered` = CRD 没装；看到反复 `Reconcile` 同一对象 = 期望态与实际态永远对不齐（典型的 status 没回写）。
+
+#### ④ reconcile 卡住的定位思路
+
+```bash
+kubectl get <kind> <name> -o yaml | grep -A5 'status:'          # 看 status 是否更新
+kubectl describe <kind> <name> | sed -n '/Events/,$p'            # 看事件时间线
+kubectl get events -n <ns> --sort-by=.lastTimestamp              # 命名空间级事件
+kubectl auth can-i get secrets -n <ns> \
+  --as=system:serviceaccount:<ns>:<operator-sa>                  # 查 Operator 的 RBAC
+```
+
+> **实战价值**：reconcile 卡住三大根因——**RBAC 不足**（`auth can-i` 查）、**依赖资源没就绪**（PVC 没绑、Service 没起）、**status 回写失败**（控制器逻辑 bug）。按"先 events → 再日志 → 再 RBAC"顺序查，别一上来改 yaml。
+
+#### ⑤ 升级 / 排障时的安全操作
+
+```bash
+kubectl get crd | grep -i <middleware>      # 升级前确认 CRD 版本（避免跨版本兼容问题）
+kubectl get <kind> -A -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec}{"\n"}'  # 批量看实例配置
+# ⚠️ 删 CRD 会连带删所有 CR（见 3.5），生产禁手滑：
+kubectl delete <kind> <name>                # 先删 CR（安全）
+kubectl delete crd <name>                   # 确认无 CR 后再删 CRD
+```
+
+> **实战价值**：删 CRD 是"核按钮"——3.5 已强调它会清掉全部 CR、进而触发 Operator 清掉 PVC/StatefulSet。**任何删除前先 `kubectl get <kind> -A` 确认范围**。升级 Operator 前先 `get crd` 看版本矩阵（呼应 L2 的 3.4 升级兼容矩阵）。
+
 ---
 
 ## 4. 逐字段表

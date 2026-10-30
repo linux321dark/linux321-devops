@@ -680,6 +680,101 @@ trivy image --format cyclonedx --output sbom.cdx.json $IMAGE
 
 ---
 
+## 3.4 常用运维命令面板（按场景）
+
+> **本节能做什么**：3.3 是"Trivy 三种用法"，本节是**每天值班 / 面试都会敲的质量门禁运维命令**——SonarQube 扫描与门禁验证、Trivy 扫描与漏洞库维护都在这。**门禁侧的肌肉记忆就来自这一张表。**
+
+### ① SonarQube 扫描与门禁验证
+
+```bash
+# 本地/CI 里跑扫描（token 走变量，别写进 properties）
+sonar-scanner \
+  -Dsonar.host.url=https://sonar.example.com \
+  -Dsonar.token=$SONAR_TOKEN \
+  -Dsonar.projectKey=my-app
+# 等扫描完看 Quality Gate 结果：
+sonar-scanner -Dsonar.qualitygate.wait=true    # 门禁不过则扫描器退出码非 0（阻断关键）
+# 用 API 查某次任务的门禁状态：
+curl -u $SONAR_TOKEN: "https://sonar.example.com/api/qualitygates/project_status?projectKey=my-app"
+```
+
+> **实战价值**：**`sonar.qualitygate.wait=true` 是门禁真正生效的开关**——设成 false，扫描器传完就退出 0，MR 照样绿，等于"假门禁"（3.3 第 4 步实验）。CI 里必须设 true，并用 `project_status` API 复核，而不是只看网页。
+
+### ② Trivy 扫描（镜像 / 配置 / SBOM）
+
+```bash
+trivy image --severity CRITICAL --exit-code 1 --no-progress $IMAGE   # 只拦 CRITICAL，阻断
+trivy config --severity HIGH,CRITICAL --exit-code 1 ./k8s/           # 扫 K8s 清单合规
+trivy k8s --severity HIGH,CRITICAL --exit-code 1 .                   # 扫集群活资源（需读权限）
+trivy image --format cyclonedx --output sbom.cdx.json $IMAGE         # 生成 SBOM（合规证据）
+trivy image --scanners secret $IMAGE                                 # 只扫硬编码密钥
+```
+
+> **实战价值**：`trivy image` 查依赖漏洞、`trivy config` 查清单合规（root/privileged/latest），**两者查的不是一回事，门禁要两道都上**。`--exit-code 1` 是阻断的硬开关——没有它，扫出 CRITICAL 流水线也绿。
+
+### ③ 漏洞库维护（库过期 = 结果失真）
+
+```bash
+trivy image --download-db-only                  # 手动更新漏洞库（离线/CI 缓存复用）
+trivy image --db-repository mirror.example.com/trivy-db  # 用内网镜像源（无外网环境）
+trivy --version                                 # 看 trivy 自身版本
+# 看库的采集时间，判断是否过期：
+trivy image --list-all-pkgs $IMAGE              # 列出所有包，间接确认 DB 是否最新
+```
+
+> **实战价值**：Trivy 的漏洞结论**完全依赖本地漏洞库**。库过期 → 扫不出新 CVE，等于门禁形同虚设（2.8 节）。**生产要把 `download-db-only` 接进定时任务或 CI 缓存**，并用内网镜像源保证无外网环境也能更新。
+
+### ④ 排障：门禁假绿 / scanner 卡住 / 结果失真
+
+```bash
+curl -u $SONAR_TOKEN: ".../api/qualitygates/project_status?projectKey=my-app"  # 复核门禁真状态
+grep sonar.qualitygate.wait sonar-project.properties                            # 是不是被设成 false
+trivy image --download-db-only                                                  # DB 过期先更新
+sonar-scanner -X                                                                 # 开 debug，看扫描卡在哪一步
+```
+
+> **实战价值**：**"网页红 but 流水线绿"或反过来，通常是 `qualitygate.wait` 设错或 API 没接**。先 `project_status` 用 API 拿到真值，再回头查配置；scanner 卡住用 `-X` 看卡在哪（多半是连不上 SonarQube 或 token 权限不够）。
+
+---
+
+## 3.5 质量门禁排障实战（3 个场景串命令）
+
+> **把 3.4 的命令用起来**：三个最典型的门禁故障，按"现象 → 敲的命令 → 怎么读"走一遍。**在测试项目上练，别动生产 SonarQube。**
+
+### 场景 A：流水线绿了，但代码明明质量不过
+
+```bash
+grep sonar.qualitygate.wait sonar-project.properties   # 现象：MR 绿但质量差
+curl -u $SONAR_TOKEN: ".../api/qualitygates/project_status?projectKey=my-app"  # 看真值
+# 若 API 返回 ERROR 但流水线绿 → wait 被设成 false
+```
+
+> **读法**：这是"假门禁"现场。根因几乎都是 `sonar.qualitygate.wait=false`——扫描器传完立刻退出 0。**CI 里必须设 true**，并用 `project_status` API 复核，不能只看网页绿不绿。
+
+### 场景 B：Trivy 扫不出新漏洞（结果失真）
+
+```bash
+trivy image --download-db-only                # 先更新漏洞库
+trivy image --list-all-pkgs $IMAGE            # 确认库是否含最新 CVE 数据
+trivy image --severity CRITICAL --exit-code 1 $IMAGE   # 再扫，确认能拦住
+```
+
+> **读法**：扫不出新 CVE = 漏洞库过期。`--download-db-only` 更新后重扫；无外网环境要配 `--db-repository` 内网源，否则库永远停在第一次拉的版本。
+
+### 场景 C：scanner 卡住 / 连不上 SonarQube
+
+```bash
+sonar-scanner -X                              # 开 debug，看卡在哪一步
+curl -I https://sonar.example.com             # SonarQube 服务活不活
+echo $SONAR_TOKEN                             # token 有没有注入（别 echo 明文，只看有没有值）
+```
+
+> **读法**：`-X` 会打印每一步网络/解析；卡在连接 → 服务或网络问题；卡在认证 → token 没注入或权限不够（project 没授权该 token）。**token 必须走 Masked 变量，别写进 `sonar-project.properties`**（那是提交进 Git 的文件）。
+
+> **三个场景的共同心法**：**先 `project_status`/重扫拿到真值 → 再区分"是配置错（wait=false）还是库过期还是连不上" → 最后才是改配置或更新库。门禁最怕"假绿"，一切以 API 真值为准。**
+
+---
+
 ## 4. 逐字段表
 
 ### 4.1 `sonar-project.properties` 关键配置

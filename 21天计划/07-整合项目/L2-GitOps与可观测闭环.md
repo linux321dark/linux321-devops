@@ -33,7 +33,9 @@ L2 GitOps 与可观测闭环
 │   ├─ 3.3 把"发布"和"指标"绑在一起（版本标签埋点）
 │   ├─ 3.4 Grafana Annotation：把发布事件叠到看板上
 │   ├─ 3.5 最小混沌演练：设计、执行、复盘
-│   └─ 3.6 成本与收益闭环（FinOps 视角与其边界）
+│   ├─ 3.6 成本与收益闭环（FinOps 视角与其边界）
+│   ├─ 3.7 端到端排障与运维命令速查（按全链路环节）
+│   └─ 3.8 端到端排障实战（三场景串命令）
 │
 ├─ 4. 逐字段表
 │   ├─ 4.1 闭环环节 × 工具 × 产物 × 责任人 × 验证方式
@@ -941,6 +943,184 @@ labels:
 | **L4** | 自动优化 | KEDA / HPA 基于业务指标 + 定时伸缩策略 | **需要人审慎设置护栏** |
 
 > **推荐落地顺序：L1 → L2 → L3，L4 慎重。** **L4 的风险在于"自动优化出错时的爆炸半径"**——一个写错的自动伸缩策略在业务高峰把副本缩到 0。**建议 L4 只在非核心服务上开，且必须配 `minReplicas` 地板和 PDB。**
+
+---
+
+### 3.7 端到端排障与运维命令速查（闭环运行期）
+
+> **本节能做什么**：3.1–3.6 讲的是"怎么把交付闭环和可观测闭环接起来"，本节是"闭环转起来之后，**每天值班 / 面试都会敲的端到端排障命令**"——按全链路环节归类（代码提交 → CI 构建 → 镜像推 Harbor → ArgoCD 同步 → K8s 运行 → 监控告警），每条配真实例子。闭环类系统的排障难点是"链路长 + 静默失败多"，这一张表就是运行期的肌肉记忆。
+
+#### ① 代码提交与 CI 构建排障（链路最前端）
+
+```bash
+git rev-parse HEAD                              # 取当前 commit SHA（= 镜像 tag，全链路排障锚点）
+git log --oneline -10                           # 看最近提交，确认本次提交在列
+git status                                      # 看是否被 .gitignore 漏掉关键文件导致 CI 没触发
+glab ci status                                  # GitLab CLI 看本次流水线状态（红/绿）
+glab ci get-log <job-id>                        # 看某个 Job 日志（无 CLI 就用网页）
+gitlab-runner verify                            # 私有 Runner 是否在线（流水线一直 Pending 先查这个）
+kubectl get pods -n gitlab-runner               # Runner 以 Pod 形式跑时的状态
+```
+
+> **实战价值**：链路排障第一原则——**先用 `git rev-parse HEAD` 拿到 SHA，它就是贯穿 CI / Harbor / ArgoCD / K8s 的锚点**。流水线 Pending 不一定是代码问题，八成是 Runner 掉线或配额满；先看 `glab ci status` 再决定往哪段查。
+
+#### ② 镜像推 Harbor / ACR 排障（制品这一环）
+
+```bash
+docker images | grep order-api                 # 确认本地镜像与 tag（tag 必须 = commit SHA）
+docker tag order-api:<sha> registry.cn-hangzhou.aliyuncs.com/linux321-devops/order-api:<sha>
+docker push registry.cn-hangzhou.aliyuncs.com/linux321-devops/order-api:<sha>
+docker buildx build --platform linux/amd64 -t <repo>:<sha> --push .   # 跨平台构建直推
+docker logout registry.cn-hangzhou.aliyuncs.com && docker login ...    # 401 先清登录态重登
+cat ~/.docker/config.json | grep auth          # 看 ACR 凭据是否还在（401 先查这个）
+crane digest <repo>:<sha>                      # 看 Harbor/ACR 里这个 SHA 的 digest 是否真存在
+skopeo inspect docker://<repo>:<sha>           # 不拉全镜像只查 manifest（比对 size/config）
+```
+
+> **实战价值**：`ImagePullBackOff` 在整合项目里 80% 是"tag 不对 / 凭据过期 / 架构不匹配"三选一。`crane digest` 能在不拉镜像的前提下确认制品到底进没进仓库——**比盲目重推省十分钟**。架构坑：Mac 上是 arm64，生产节点是 amd64，必须 `buildx --platform linux/amd64`。
+
+#### ③ ArgoCD 同步排障（GitOps 拉模型）
+
+```bash
+argocd app list                                # 看所有 App 的 SYNC / HEALTH 状态
+argocd app get order-api                       # 看单个 App 的资源树与同步详情
+argocd app sync order-api                      # 手动触发同步（PR 合并后没自动拉时）
+argocd app diff order-api                      # 预览"Git 期望态 vs 集群实际态"差异（漂移检测第一招）
+argocd app history order-api                   # 看部署历史（回滚用）
+argocd app rollback order-api 3                # 回滚到历史版本 3
+argocd app manifests order-api                 # 看 ArgoCD 最终会 apply 的渲染后清单
+kubectl get app -n argocd order-api -o yaml    # 直接看 App CR（OUT_OF_SYNC 字段）
+```
+
+> **实战价值**：`Synced` 但 `OutOfSync` 反复横跳 = 有人在集群里手改（漂移）；`Synced` 但 `Not Healthy` = 应用起了但探针 / 依赖没就绪。**ArgoCD 排障先 `app get` 看状态，再 `app diff` 看差异，别一上来就手动 `kubectl`。**
+
+#### ④ K8s 运行态排障（集群这一环）
+
+```bash
+kubectl get pods -n prod -o wide -l app=order-api     # 看 Pod 落在哪节点 / IP（NODE 列第一入口）
+kubectl rollout status deploy/order-api -n prod       # 发布是否就绪
+kubectl describe deploy/order-api -n prod             # 看新 ReplicaSet 为什么起不来
+kubectl logs -f deploy/order-api -n prod --tail=100   # 跟应用日志
+kubectl logs deploy/order-api -n prod -p --tail=50    # 看崩溃前日志（CrashLoop 必用 -p）
+kubectl get events -n prod --sort-by=.lastTimestamp   # 看集群事件（OOMKilled / FailedScheduling）
+kubectl top pods -n prod                             # 看资源占用（HPA 是否真生效）
+kubectl get hpa -n prod                             # 看分母是否为 <unknown>（没写 requests）
+```
+
+> **实战价值**：整合项目里 `CrashLoopBackOff` 多半是"新镜像配置读不到 Secret"或"依赖的 Redis / DB 没起来"。**`logs -p` 拿崩溃瞬间日志，`describe` 的 Last State 拿退出码，两个一起看才准。** HPA 显示 `<unknown>` 就是忘了写 `resources.requests`，副本永远不扩。
+
+#### ⑤ 监控告警排障（观测闭环这一环）
+
+```bash
+kubectl get pods -n monitoring | grep -E 'prometheus|grafana|loki|alertmanager'   # 组件是否活着
+kubectl port-forward -n monitoring svc/prometheus 9090:9090   # 本地起 Prometheus 界面查 PromQL
+promtool check rules /etc/rules/*.yaml             # 校验 PrometheusRule 语法（CI 门禁用）
+kubectl get prometheusrule -n prod -o yaml         # 看告警规则是否加载
+kubectl get servicemonitor -n prod                 # 看抓取目标是否注册（没它就没指标）
+amtool alert query                                 # 查 Alertmanager 当前活跃告警
+amtool silence add alertname=OrderErrorRate --duration=1h   # 维护窗口静默告警
+kubectl logs -n monitoring deploy/loki -f          # Loki 卡住先查它自己
+```
+
+> **实战价值**："没告警"不一定是没问题——先 `amtool alert query` 确认告警真的发出来了，还是 Prometheus 根本没抓到指标（`ServiceMonitor` 没注册）。**观测闭环排障要分清"数据没采到"和"告警没路由"两件事。** `promtool` 把规则语法错误挡在 CI 阶段，比上线后发现强。
+
+#### ⑥ 环境差异比对与配置漂移检测（面试高频）
+
+```bash
+# 配置漂移：Git 期望态 vs 集群实际态
+argocd app diff order-api                          # ArgoCD 视角的漂移（最权威）
+kubectl diff -f manifests/ -n prod                 # 本地清单 vs 集群实际态
+# 环境差异：测试 vs 生产（逐字段比对）
+kubectl get deploy/order-api -n test -o yaml > /tmp/test.yaml
+kubectl get deploy/order-api -n prod -o yaml > /tmp/prod.yaml
+diff /tmp/test.yaml /tmp/prod.yaml                 # 全量 diff
+# 只比关键维度（副本数 / 镜像 / 资源 / 环境变量）
+kubectl get deploy/order-api -n test -o jsonpath='{.spec.replicas}'; echo
+kubectl get deploy/order-api -n prod -o jsonpath='{.spec.replicas}'; echo
+kubectl get deploy/order-api -n prod -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
+# ConfigMap / Secret 漂移
+kubectl get cm/order-api-config -n prod -o yaml    # 比对配置是否和 Git 里的一致
+```
+
+> **实战价值**：**"测试能过、生产挂"几乎都源于环境差异**——副本数、资源 limit、环境变量、镜像 tag 某一项没对齐。`diff` 两环境的 yaml 是最快定位法；`argocd app diff` 则直接告诉你"集群被手改了多少"。**面试能现场说出"怎么比对两环境差异、怎么检测漂移"，就是配置管理岗的加分项。**
+
+#### ⑦ 回滚全链路（应用 + DB + 缓存）
+
+```bash
+# ① 应用层回滚（GitOps 托管的应用）
+argocd app rollback order-api <last-good>          # ArgoCD 回滚到上一个健康版本
+# 或直接 kubectl（非 GitOps 托管时）
+kubectl rollout undo deploy/order-api -n prod
+# ② DB 回滚（仅当本次发布含不兼容 schema 变更，且迁移脚本向下兼容、已提前备好）
+kubectl exec -n prod deploy/order-api -- \
+  flyway migrate -url=$DB_URL -user=$DB_USER -password=$DB_PWD -locations=filesystem:/db/rollback
+# ③ 缓存处理（清脏缓存，避免读到旧结构；仅当缓存可安全重建）
+kubectl exec -n prod deploy/redis -- redis-cli flushall
+# ④ 回滚后验证三连
+kubectl rollout status deploy/order-api -n prod
+curl -s https://order.example.com/healthz          # 业务健康
+argocd app get order-api                           # 确认 Healthy 且 Synced
+# ⑤ 一致性校验：应用版本标签与 DB schema 版本对齐
+kubectl get deploy/order-api -n prod -o jsonpath='{.spec.template.metadata.labels.version}'; echo
+```
+
+> **实战价值**：**回滚顺序 = 应用先回、依赖后回、缓存最后清**；DB 回滚是最后手段——优先用"向前兼容迁移"避免回滚数据（数据回滚的爆炸半径远大于应用）。**缓存能重建就 flush，不能重建就靠版本键隔离。** 这条顺序是面试里"发布翻车怎么救"的标准答案。
+
+---
+
+### 3.8 端到端排障实战（三个闭环场景串命令）
+
+> **把 3.7 的命令用起来**：三个闭环运行期最典型的故障，按"现象 → 敲的命令 → 怎么读"走一遍。重点练"告警 → 定位 → 改 Git → 自动同步 → 恢复"这条标准动作链（见 3.2）。**都在 kind 集群 `day2` 上练，别在生产试。**
+
+#### 场景 A：告警响了但定位不到哪次发布（版本标签断了）
+
+```bash
+amtool alert query                                 # ① 确认告警真发出来了（不是静默/路由错了）
+kubectl get prometheusrule -n prod -o yaml | grep -A5 OrderErrorRate   # ② 看规则在不在
+sum by(version) (rate(http_requests_total{app="order-api"}[5m]))       # ③ PromQL 看有几个 version
+# 现象：只返回 1 个值（全 latest）→ 版本标签断了，指标对不上发布
+kubectl get pods -n prod -l app=order-api --show-labels   # ④ 看 Pod 上有没有 version label
+kubectl get servicemonitor -n prod -o yaml | grep sourceLabels   # ⑤ 看 relabel 是不是从 __meta_* 取
+```
+
+> **读法**：**闭环排障第一坑是"静默失败"**——告警没出来，往往不是没问题，而是版本标签断了导致指标查不到版本维度。`sum by(version)` 只返回一个值，就是 3.2 / 3.3 讲的"标签基数"问题：**Pod label 没打 version，或 ServiceMonitor 的 relabel 没从 `__meta_kubernetes_pod_label_version` 取。** 先 `amtool` 确认告警真发出，再顺着标签查，别在指标层面瞎猜。
+
+#### 场景 B：改了 Git 但没自动同步（闭环断在 ArgoCD / Webhook）
+
+```bash
+argocd app get order-api                           # ① 看 SYNC 状态：OutOfSync 且不自动同步
+argocd app diff order-api                          # ② 看 Git 期望态 vs 集群实际态差异
+git -C gitops-repo log --oneline -5                # ③ 确认 PR 真的合并进 GitOps 仓库
+argocd app sync order-api                          # ④ 手动补同步（Webhook 没触发时）
+argocd app wait order-api --health                 # ⑤ 等 Healthy
+kubectl get app -n argocd order-api -o yaml | grep -E 'operation|syncPolicy'   # ⑥ 看自动同步开关
+```
+
+> **读法**：闭环断在"Git 改了但集群没动"——先确认 **GitOps 仓库的 PR 真合并了**（`git log`），再看 **ArgoCD 是否开了自动同步**（`syncPolicy.automated`）。没开就 `app sync` 手动补；开了还不同步，查 Webhook 是否打到 ArgoCD 或网络是否通。**闭环的核心纪律：Git 是唯一事实源，一切变更走 Git，集群被手改会被 SelfHeal 拉回（这正是 3.2 强调的）。**
+
+#### 场景 C：发布引发劣化要全链路回滚（应用 + DB + 缓存，并叠 Annotation）
+
+```bash
+# ① 告警确认劣化（错误率 / 延迟突增）
+amtool alert query
+# ② 先止血：应用回滚
+argocd app rollback order-api <last-good>
+# ③ 判 DB 是否需回滚（含不兼容 schema 变更才回滚，否则跳过）
+kubectl get cm/order-api-config -n prod -o yaml | grep DB_SCHEMA_VERSION
+# ④ 清脏缓存（仅可重建时）
+kubectl exec -n prod deploy/redis -- redis-cli flushall
+# ⑤ 回滚后三连验证
+kubectl rollout status deploy/order-api -n prod
+curl -s https://order.example.com/healthz
+amtool alert query                                 # 确认告警已解除
+# ⑥ 把这次发布/回滚事件叠到 Grafana 时间轴（闭环复盘用，见 3.4）
+curl -X POST http://grafana:3000/api/annotations -H "Content-Type: application/json" \
+  -d '{"text":"rollback order-api to <last-good>","tags":["release","rollback"],"time":'<ms'>'
+```
+
+> **读法**：**闭环里回滚不是终点，是复盘的起点**——回滚后要把事件写成 Grafana Annotation（3.4 讲的接缝④），下次看板上一眼能看到"哪次发布引发了劣化、哪次回滚救了场"。回滚顺序仍是"应用先回、依赖后回、缓存最后清"，DB 能不回就不回。**面试加分点：能说出"闭环排障 = 告警 → 定位 → 改 Git → 同步 → 恢复 → 标注"，并把六步和对应工具对上，就是可观测岗的高分答案。**
+
+> **三个场景的共同心法**：① **闭环排障先确认"数据 / 告警真发了没有"**，静默失败比报错更危险；② **用 commit SHA 与 version 标签做锚点**，把"哪次发布"钉死；③ **回滚优先于修，标注闭环**——止血后别忘了在 Grafana 留痕，让下一次排障有迹可循。整合项目的排障，比单工具难在"链路长 + 反馈环"，把 3.7 每段命令练熟，面试时画得出"代码 → CI → Harbor → ArgoCD → K8s → 监控 → 人 → 改 Git"这条带反馈的环，就稳了。
 
 ---
 

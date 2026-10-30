@@ -914,4 +914,59 @@ spec:
 
 ---
 
+## 9. 常用运维命令（调度 / QoS 排障速查）
+
+> **本节能做什么**：L7 讲调度约束与 QoS，本节把**调度相关的实战命令**按场景归类——污点/容忍实战、节点亲和与拓扑分布、QoS 与资源水位核查，以及"Pod 调度不出去"的实战排障。**`cordon`/`drain` 已在 L1，本篇补节点亲和与污点这一层。**（注：调度实验需要多节点集群，本地 kind 单节点做不了，见 L1 §2.5）
+
+### ① 污点与容忍实战
+
+```bash
+kubectl get nodes -o custom-columns='NAME:.metadata.name,TAINTS:.spec.taints'   # 看节点上的污点
+kubectl taint nodes node1 dedicated=special:NoSchedule     # 打污点：专用节点，不容忍的 Pod 不调度
+kubectl taint nodes node1 dedicated:NoSchedule-            # 去掉这个污点（末尾减号）
+kubectl describe pod <pod> -n prod | grep -A5 Tolerations  # 看 Pod 是否带对应 toleration
+kubectl describe node node1 | sed -n '/Taints/,/Events/p'  # 节点维度的污点/条件
+```
+
+> **实战价值**：污点是"节点拒绝 Pod"的硬约束，toleration 是 Pod 的"豁免条"。专用节点、GPU 节点、不可调度维护都靠它；打错污点会导致整批 Pod Pending，上线前用 `get nodes` 核对。
+
+### ② 节点亲和 / 反亲和 / 拓扑分布
+
+```bash
+kubectl get pods -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName'   # Pod 落在哪些节点
+kubectl describe pod <pod> -n prod | grep -iA6 'Affinity\|Node-Selectors'      # 看实际亲和/选择器
+kubectl get nodes -l disktype=ssd                  # 节点标签是亲和/选择器的依据
+kubectl label nodes node1 disktype=ssd             # 打标签（亲和匹配的前提）
+kubectl get pods -n prod -o wide | awk '{print $7}' | sort | uniq -c   # 统计各节点上的 Pod 数（看拓扑分布）
+```
+
+> **实战价值**：亲和/反亲和/拓扑分布都是"软硬约束"——硬约束不满足就 Pending，软约束不满足只是打分低。`describe pod` 的 Affinity 段能直接看到 Pod 到底声明了哪些约束，是排查"为什么都挤在一个节点"的入口。
+
+### ③ QoS 与资源水位核查
+
+```bash
+kubectl top nodes                                     # 节点 CPU/内存水位（是否快打满）
+kubectl top pods -n prod --sort-by=memory             # 按内存排序，找吃内存的 Pod
+kubectl get pods -n prod -o custom-columns='NAME:.metadata.name,QOS:.status.qosClass'   # 看 QoS 等级
+kubectl describe node node1 | grep -A6 'Allocated resources'   # 节点已分配 requests/limits 占比
+```
+
+> **实战价值**：节点内存不够时，**驱逐顺序是 BestEffort → Burstable → Guaranteed**——`qosClass` 直接决定谁先被杀。`Allocated resources` 看节点 requests 占比，能预判"还能不能再加 Pod"。
+
+### ④ 排障实战：Pod 卡 Pending（调度失败）
+
+```bash
+kubectl describe pod <pod> -n prod | grep -A10 Events
+# 典型：FailedScheduling: 0/3 nodes are available:
+#   - 3 node(s) had taint {dedicated: special}  → 污点没容忍
+#   - 1 node(s) Insufficient cpu                → 资源不够
+#   - 2 node(s) didn't match Pod's node affinity → 亲和/标签不匹配
+kubectl get nodes -o wide
+kubectl describe node <node> | grep -i taint
+```
+
+> **读法**：调度失败看 `describe pod` 的 FailedScheduling 明细——它**逐节点逐条说了为什么不行**，比猜快得多。污点、资源、亲和是三大类，对号入座即可。
+
+---
+
 **下一篇**：[`L8-弹性HPA.md`](L8-弹性HPA.md)（本篇 2.6 节的 requests/limits 分母问题，在那里展开成完整链路） · **上一级**：[`../00-学习地图与前置依赖.md`](../00-学习地图与前置依赖.md) · **上一篇**：[`L2-K8s架构与对象模型.md`](L2-K8s架构与对象模型.md)

@@ -1139,4 +1139,56 @@ spec:
 
 ---
 
+## 9. 常用运维命令（HPA 排障速查）
+
+> **本节能做什么**：L8 讲 HPA 怎么算副本，本节把**弹性扩缩容日常排障命令**按场景归类——HPA 状态与指标核查、扩缩边界调整、ScalingLimited/AbleToScale 异常判读，以及"TARGETS 显示 `<unknown>`"实战排障。**HPA 的分母就是 Pod 的 `resources.requests`，分子来自 metrics-server。**
+
+### ① HPA 状态与指标核查
+
+```bash
+kubectl get hpa -n prod -o wide                     # 看当前/目标副本、TARGETS、MIN/MAX
+kubectl describe hpa web -n prod                    # 看 Metrics / Targets / Conditions / Events
+kubectl get hpa web -n prod -o yaml                 # 看完整 spec 与 status
+kubectl top pods -n prod                            # 真实用量（HPA 算比例的分子来源）
+```
+
+> **实战价值**：`kubectl top` 正常但 HPA 不扩 → 多半是 Deployment 没设 `resources.requests.cpu`（分母缺失）；`top` 本身 `<unknown>` → metrics-server 没装或异常，那 HPA 一定算不了。
+
+### ② 扩缩边界与触发验证
+
+```bash
+kubectl patch hpa web -n prod -p '{"spec":{"maxReplicas":10}}'     # 调上限（scale 子命令部分版本支持）
+kubectl patch hpa web -n prod -p '{"spec":{"minReplicas":2}}'      # 调下限
+kubectl get hpa web -n prod -w                                  # watch 扩缩过程
+# 制造负载验证：kubectl exec 进 Pod 跑压测，观察 TARGETS 与副本变化
+```
+
+> **实战价值**：调边界用 `patch` 比改 yaml 快；`-w` 能实时看到副本从 N 变到 M 的全过程，验证 HPA 是否真在工作，而不是只看静态配置。
+
+### ③ 异常与告警场景判读
+
+```bash
+kubectl describe hpa web -n prod | grep -iA3 Condition
+# ScalingLimited=True   → 触到 min/max 边界（再涨/再降都被卡）
+# AbleToScale=False     → 缺 metrics 或目标 Deployment 不可用（如 replicas 为 0）
+# ScalingActive=False   → 取不到指标（分母缺失/指标后端断）
+kubectl get apiservice v1beta1.metrics.k8s.io        # metrics-server 聚合 API 是否 Available
+```
+
+> **实战价值**：HPA 的 Conditions 是"为什么不扩/不缩"的完整说明书。`ScalingLimited` 不是故障（只是到边界），`AbleToScale=False`/`ScalingActive=False` 才是真问题，分别指向目标不可用和指标断流。
+
+### ④ 排障实战：HPA TARGETS 显示 `<unknown>`
+
+```bash
+kubectl top pods -n prod                    # 若也是 <unknown> → metrics-server 没装/挂了
+kubectl get apiservice v1beta1.metrics.k8s.io   # 看聚合 API 状态
+kubectl -n kube-system get pods | grep metrics-server
+# 若 top 正常但 HPA <unknown> → 目标 Deployment 未设 resources.requests.cpu
+kubectl get deploy web -n prod -o jsonpath='{.spec.template.spec.containers[0].resources.requests}'
+```
+
+> **读法**：`<unknown>` 两步定位——先看 `kubectl top`：也 unknown 是 metrics-server 链路断了；top 正常但 HPA unknown，是目标工作负载的 `requests` 缺失（HPA 没有分母，无法算利用率）。
+
+---
+
 **上一篇**：[`L7-调度与QoS与资源管理.md`](L7-调度与QoS与资源管理.md) · **下一篇**：[`L9-安全RBAC与合规.md`](L9-安全RBAC与合规.md) · **上一级**：[`../00-学习地图与前置依赖.md`](../00-学习地图与前置依赖.md)

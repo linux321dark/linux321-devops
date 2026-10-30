@@ -37,7 +37,9 @@ L3 Grafana 仪表盘与告警
 ├─ 3. 动手
 │   ├─ 3.1 本地起一个 Grafana（只读本地已有资源）
 │   ├─ 3.2 加数据源 → 建变量 → 建面板（每步写清"看到什么算对"）
-│   └─ 3.3 用 provisioning 复现同一个看板
+│   ├─ 3.3 用 provisioning 复现同一个看板
+│   ├─ 3.4 常用运维命令（按场景）
+│   └─ 3.5 运维排障实战（场景串命令）
 │
 ├─ 4. 逐字段表
 │   ├─ 4.1 Dashboard Provisioning yaml 关键字段表
@@ -796,6 +798,121 @@ volumes:
 | **文件即真相** | 改本地 yaml → 等 `updateIntervalSeconds` → 刷新 UI | **看板跟着变** |
 
 > **最后一条是 provisioning 的真正价值**：**改看板不需要登录 Grafana，不需要点 UI，不需要"记得同步给同事"。** 这才是配置即代码。
+
+---
+
+### 3.4 常用运维命令（按场景）
+
+> **本节能做什么**：3.1–3.3 是"把看板建出来"，本节是**Grafana 本身挂了、看板不显示、插件丢了、密码忘了时**的日常运维命令——按场景归类，每条配真实例子。**Grafana 排障的肌肉记忆就来自这一张表。**
+
+### ① CLI 运维（grafana-cli：装插件、改密码、备份）
+
+```bash
+grafana-cli plugins list-remote | grep -i mysql        # 看远程仓库有哪些插件可装
+grafana-cli plugins install grafana-piechart-panel      # 装插件（装完要重启 grafana）
+grafana-cli plugins ls                                 # 看本地已装插件
+grafana-cli admin reset-admin-password 'NewPass123'    # 忘 admin 密码时重置（救火第一招）
+grafana-cli backup create                              # 备份（部分版本/企业版支持）
+```
+
+> **实战价值**：`grafana-cli admin reset-admin-password` 是**忘了 admin 密码唯一的官方解法**，比改数据库安全；插件装完必须重启 Grafana 进程才生效——很多人"装了不显示"就是没重启。
+
+### ② 数据库排障（Grafana 的真相在 grafana.db 这个 sqlite 里）
+
+```bash
+sqlite3 /var/lib/grafana/grafana.db ".tables"                                  # 看库里有哪些表（dashboard / user / session ...）
+sqlite3 /var/lib/grafana/grafana.db "SELECT slug,title FROM dashboard;"        # 查看板有没有写进库
+sqlite3 /var/lib/grafana/grafana.db "SELECT login,is_admin FROM user;"          # 查用户/权限
+ls -lh /var/lib/grafana/grafana.db                                             # 库文件在不在、多大
+```
+
+> **实战价值**：Grafana 是**有状态**的——看板、用户、数据源权限全在 `grafana.db`（sqlite）。**迁移/恢复就是拷这个文件**；看板"建了找不到"先看 dashboard 表里有没有行。这是 §2.11 provisioning 之外另一个真相源。
+
+### ③ API 调用（不用 UI 也能查/建一切）
+
+```bash
+curl -s http://localhost:3000/api/health                                                  # 健康检查（探针用）
+curl -s -u admin:admin http://localhost:3000/api/datasources                              # 列数据源（确认数据源连得上没）
+curl -s -u admin:admin http://localhost:3000/api/dashboards/uid/<UID>                    # 取某个看板 JSON
+curl -s -u admin:admin -X POST -H 'Content-Type: application/json' \
+  --data-binary @dash.json http://localhost:3000/api/dashboards/db                        # 用 API 导入看板（配置即代码）
+curl -s -u admin:admin http://localhost:3000/api/org/users                              # 看组织内用户
+```
+
+> **实战价值**：`/api/health` 比 ping 端口更可靠——它确认应用真的起来了；`/api/datasources` 能确认"数据源配置在不在、URL 对不对"，是看板不显示数据时第一道排查。**用 API 导入看板 = provisioning 的另一种形态，面试常问"怎么不点 UI 批量建看板"。**
+
+### ④ 数据源与 provisioning 校验
+
+```bash
+curl -s -u admin:admin http://localhost:3000/api/datasources | grep -o '"name":"[^"]*"'   # 列已配数据源名
+curl -s -u admin:admin http://localhost:3000/api/datasources/name/Prometheus             # 按名查单个数据源
+ls /etc/grafana/provisioning/dashboards/ /etc/grafana/provisioning/datasources/          # provisioning 文件在不在
+grafana-server -config /etc/grafana/grafana.ini -check-config                            # 校验 grafana.ini
+```
+
+> **实战价值**：provisioning 看板不出现，**先确认 yaml 文件在 provisioning 目录里、且 `updateIntervalSeconds` 之后刷新了 UI**（§3.3）。`grafana-server -check-config` 能在启动前挡掉 ini 语法错。
+
+### ⑤ 进程、端口、日志（最外层排障）
+
+```bash
+systemctl status grafana-server          # 服务状态（起没起、有没有自动重启）
+systemctl restart grafana-server          # 装完插件/改完 ini 后重启
+ss -ltnp | grep 3000                      # 端口在不在
+journalctl -u grafana-server -n 100 --no-pager   # 看最近 100 行日志（插件加载失败、DB 锁都在这里）
+```
+
+> **实战价值**：Grafana 起不来，十有八九在日志里——`journalctl -u grafana-server` 看"DB 锁 / 插件不兼容 / 端口被占"。**日志是 Grafana 排障的最后真相，但往往是第一入口。**
+
+### ⑥ 通用：配置与备份纪律
+
+```bash
+grep -E '^\[|path|http_port' /etc/grafana/grafana.ini | head    # 看关键配置（端口、路径、DB 位置）
+cp /var/lib/grafana/grafana.db /backup/grafana-$(date +%F).db   # 备份数据库（有状态组件必做）
+grafana-cli backup create                                       # 或用官方备份命令
+```
+
+> **实战价值**：Grafana 是有状态服务，**升级/迁移前先 `cp grafana.db`**。面试被问"Grafana 怎么备份"——答"拷 grafana.db + 导出 provisioning 文件"，不是"重新点一遍 UI"。
+
+---
+
+### 3.5 运维排障实战（场景串命令）
+
+> **把 3.4 的命令用起来**：三个最典型的 Grafana 故障，按"现象 → 敲的命令 → 怎么读"走一遍。**都建议在本地 / 测试 Grafana 上练，别动生产。**
+
+### 场景 A：看板打开了，但面板全是 "No data"
+
+```bash
+curl -s -u admin:admin http://localhost:3000/api/datasources | grep -o '"name":"[^"]*"'   # 确认数据源在
+sqlite3 /var/lib/grafana/grafana.db "SELECT url FROM datasource;"                         # 看数据源指向的 URL
+curl -s http://<数据源URL>/api/v1/query?query=up                                         # 直连后端验数据在不在
+# 典型：数据源 URL 写错 / 选了错的数据源类型 / 时间范围不匹配
+```
+
+> **读法**：面板 "No data" **先确认数据源配置对不对**（`/api/datasources` + 数据库查 url），再直连后端（`curl` 打 Prometheus/Loki）确认数据本身有。Grafana 不存数据，它只是代理——"没数据"的锅 90% 在后端或数据源配置。
+
+### 场景 B：装了插件，看板里选不到 / Grafana 起不来
+
+```bash
+grafana-cli plugins ls                          # 确认插件确实装上了
+journalctl -u grafana-server -n 50 --no-pager   # 看是不是插件版本不兼容导致启动失败
+systemctl restart grafana-server                # 装完必须重启
+ls /var/lib/grafana/plugins/                    # 插件文件在不在磁盘上
+```
+
+> **读法**：Grafana 启动失败且日志里有 plugin 相关报错，**多半是插件版本与 Grafana 大版本不兼容**——卸掉重装匹配版本。装完不显示，先看 `plugins ls` 在不在、再确认重启过没。
+
+### 场景 C：忘了 admin 密码 / grafana.db 损坏
+
+```bash
+grafana-cli admin reset-admin-password 'NewPass123'   # 重置密码（首选，不动库）
+sqlite3 /var/lib/grafana/grafana.db ".tables"         # 若重置仍失败，查库是否损坏
+cp /backup/grafana-$(date +%F).db /var/lib/grafana/grafana.db   # 库坏了从备份恢复（会丢备份后的改动）
+systemctl restart grafana-server
+```
+
+> **读法**：密码忘 → `grafana-cli admin reset-admin-password`（官方解法，不要手改库）；库损坏 → 从备份的 `grafana.db` 恢复，**这是为什么要备份 grafana.db（见 ⑥）**。两者都印证了"Grafana 是有状态的，真相在 grafana.db"。
+
+> **三个场景的共同心法**：**Grafana 不存数据，先分清"锅在后端/数据源"还是"锅在 Grafana 自身"**。分清了，A 是后端问题、B/C 是 Grafana 自身问题——定位快一倍。
 
 ---
 

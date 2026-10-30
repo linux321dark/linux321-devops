@@ -323,24 +323,24 @@ curl http://127.0.0.1:18080/
 
 ### 4.1 Deployment
 
-| 字段 | 类型 | 必填 | 含义 | 写错的后果 |
-|---|---|---|---|---|
-| `apiVersion: apps/v1` | string | ✅ | API 组与版本 | 写 `extensions/v1beta1` → **该版本早已废弃，报错** |
-| `kind: Deployment` | string | ✅ | 对象类型 | 拼错 → `no matches for kind` |
-| `metadata.name` | string | ✅ | 对象名 | 重复 → `AlreadyExists` |
-| `spec.replicas` | int | | 期望副本数，**HPA 会改它** | — |
-| `spec.selector.matchLabels` | map | ✅ | **选哪些 Pod 归我管** | 与 template 标签不一致 → `apply` 直接报错 |
-| `spec.template.metadata.labels` | map | ✅ | 打给 Pod 的标签 | 必须与 selector **完全一致** |
-| `spec.template.spec.containers[]` | list | ✅ | 容器定义 | — |
-| `.name` | string | ✅ | 容器名 | 同一 Pod 内不可重名 |
-| `.image` | string | ✅ | 镜像地址 | 私有仓库无凭据 → `ImagePullBackOff` |
-| `.imagePullPolicy` | enum | | `IfNotPresent`(默认 for 非 latest) / `Always` / `Never` | `Always` + 私有仓库 → 每次都 401 |
-| `.ports[].containerPort` | int | | **声明**容器监听端口（不限制） | 与 Service 的 targetPort 对不上 → 访问不通 |
-| `.resources.requests.cpu` | Quantity | | **调度依据 + HPA 分母** | 漏写 → HPA `<unknown>/50%` |
-| `.resources.limits.cpu` | Quantity | | 上限，超了被节流（**不杀容器**） | 太低 → 采集值顶到 limit → **分母是 requests 时利用率反而偏高、照样扩但每个新 Pod 同样被限死**；真正「有值但不扩」的是分母被撑大 |
-| `.livenessProbe` | Probe | | 失败 → **重启容器** | 探针写错 → 容器反复重启 |
-| `.readinessProbe` | Probe | | 失败 → **摘出 Service 端点，不重启** | 探针太严 → 一直 0/1，流量进不来 |
-| `.startupProbe` | Probe | | 启动慢的应用用它，成功后才启用其他探针 | 不用 → 慢启动应用被 liveness 误杀 |
+| 字段                                | 类型       | 必填  | 含义                                                   | 写错的后果                                                                           |
+| --------------------------------- | -------- | --- | ---------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `apiVersion: apps/v1`             | string   | ✅   | API 组与版本                                             | 写 `extensions/v1beta1` → **该版本早已废弃，报错**                                         |
+| `kind: Deployment`                | string   | ✅   | 对象类型                                                 | 拼错 → `no matches for kind`                                                      |
+| `metadata.name`                   | string   | ✅   | 对象名                                                  | 重复 → `AlreadyExists`                                                            |
+| `spec.replicas`                   | int      |     | 期望副本数，**HPA 会改它**                                    | —                                                                               |
+| `spec.selector.matchLabels`       | map      | ✅   | **选哪些 Pod 归我管**                                      | 与 template 标签不一致 → `apply` 直接报错                                                 |
+| `spec.template.metadata.labels`   | map      | ✅   | 打给 Pod 的标签                                           | 必须与 selector **完全一致**                                                           |
+| `spec.template.spec.containers[]` | list     | ✅   | 容器定义                                                 | —                                                                               |
+| `.name`                           | string   | ✅   | 容器名                                                  | 同一 Pod 内不可重名                                                                    |
+| `.image`                          | string   | ✅   | 镜像地址                                                 | 私有仓库无凭据 → `ImagePullBackOff`                                                    |
+| `.imagePullPolicy`                | enum     |     | `IfNotPresent`(默认 for 非 latest) / `Always` / `Never` | `Always` + 私有仓库 → 每次都 401                                                       |
+| `.ports[].containerPort`          | int      |     | **声明**容器监听端口（不限制）                                    | 与 Service 的 targetPort 对不上 → 访问不通                                               |
+| `.resources.requests.cpu`         | Quantity |     | **调度依据 + HPA 分母**                                    | 漏写 → HPA `<unknown>/50%`                                                        |
+| `.resources.limits.cpu`           | Quantity |     | 上限，超了被节流（**不杀容器**）                                   | 太低 → 采集值顶到 limit → **分母是 requests 时利用率反而偏高、照样扩但每个新 Pod 同样被限死**；真正「有值但不扩」的是分母被撑大 |
+| `.livenessProbe`                  | Probe    |     | 失败 → **重启容器**                                        | 探针写错 → 容器反复重启                                                                   |
+| `.readinessProbe`                 | Probe    |     | 失败 → **摘出 Service 端点，不重启**                           | 探针太严 → 一直 0/1，流量进不来                                                             |
+| `.startupProbe`                   | Probe    |     | 启动慢的应用用它，成功后才启用其他探针                                  | 不用 → 慢启动应用被 liveness 误杀                                                         |
 
 **关于 requests 与 limits 的精确规则**（本地 `kubectl explain` 实测原文）：
 
@@ -478,6 +478,71 @@ kubectl get events --sort-by=.lastTimestamp   # 4. 跨对象时间线
 1. **能说清输入输出吗？** —— `kubectl apply` 的输入是 yaml，输出是"集群里有一组满足期望态的 Pod"；中间经过 apiserver（认证授权准入）→ etcd（记账）→ controller（催活）→ scheduler（派活）→ kubelet（干活）。
 2. **能故意改坏再倒推吗？** —— 三个实验：① 删掉 `requests.cpu` → 看 HPA 变 `<unknown>/50%`；② 把 `selector` 改成不匹配的标签 → 看 apply 报错；③ 把 `imagePullPolicy` 改成 `Always` → 看它开始反复拉镜像。**造过的错比看过的文档记得牢。**
 3. **能画上下游吗？** —— 画出 `kubectl → apiserver → etcd → controller → scheduler → kubelet → containerd → Pod` 这条链，并在每两个环节之间标出"这一步失败会看到什么状态"。
+
+---
+
+## 9. 常用运维命令（对象模型与集群探查速查）
+
+> **本节能做什么**：L2 讲的是"集群里有什么、谁管谁"。本节把**日常最该会敲的对象探查命令**按场景归类——查全量资源、顺藤摸瓜找 owner、声明式提交前校验、看控制面与节点健康。**K8s 排障的第一步永远是"先把对象看清楚"。**
+
+### ① 全资源视图与对象探查
+
+```bash
+kubectl get all -n prod                              # 命名空间内主要资源一屏看（不含 CRD/PV）
+kubectl api-resources                               # 本集群支持的所有资源类型（短名/API 组/是否 namespaced）
+kubectl api-versions                                # 所有启用的 API 组/版本
+kubectl explain pod.spec.containers                 # 查字段含义与类型，不必硬背
+kubectl explain deploy.spec.strategy --recursive    # 递归展开某字段子树
+kubectl get pods,deploy,rs,sts,svc -n prod          # 一次看多种工作负载
+```
+
+> **实战价值**：`api-resources` 是"报错说没有这个资源类型"时的第一反应；`explain` 比查文档快，面试被追问字段也能现场查。
+
+### ② 事件流与关联性追踪（谁管这个 Pod）
+
+```bash
+kubectl get events -n prod --sort-by=.lastTimestamp       # 按时间看事件，最新在下
+kubectl get events -A --field-selector type=Warning       # 只看 Warning 级事件
+kubectl get pod <pod> -o jsonpath='{.metadata.ownerReferences}'   # 反查"爸爸"是谁
+kubectl get rs -l app=web -n prod                          # 顺着 ownerReferences 找到 ReplicaSet
+kubectl get rs <rs> -o jsonpath='{.metadata.ownerReferences}'      # 再反查到 Deployment
+```
+
+> **实战价值**：Pod 异常时**先 `ownerReferences` 一路反查到 Deployment**，再去看对应控制器——很多新人直接在 Pod 上瞎改，其实改的是被控制器随时覆盖的"傀儡"。
+
+### ③ 声明式校验与差异预览（提交前必做）
+
+```bash
+kubectl apply -f x.yaml --dry-run=client     # 本地校验语法（不做类型转换）
+kubectl apply -f x.yaml --dry-run=server     # 服务端完整校验（能查类型/字段错）
+kubectl diff -f x.yaml                        # 预览这次 apply 会改哪些字段，不动手
+kubectl create -f x.yaml --dry-run=server --validate=true
+```
+
+> **实战价值**：`diff` 在改生产前先确认"到底会变什么"，把"盲 apply 把别的东西改坏"的概率降到最低；`--dry-run=server` 是提交前的最后一道闸。
+
+### ④ 集群拓扑与组件健康
+
+```bash
+kubectl get nodes -o wide                              # 节点角色/版本/内外部 IP
+kubectl get pods -n kube-system                        # 控制面与核心插件（CoreDNS/网络插件）
+kubectl cluster-info                                   # apiserver/控制面端点概览
+kubectl get apiservice | grep -v True                  # 聚合 API（如 metrics.k8s.io）是否 Available
+kubectl top nodes                                      # 节点资源水位（需 metrics-server）
+```
+
+> **实战价值**：`kube-system` 里的 Pod 决定集群能不能用；`apiservice` 里 `metrics.k8s.io` 非 True，会导致 `kubectl top` 与 HPA 全部失效——这是系统性故障的隐藏入口。
+
+### ⑤ 排障实战：一个 Pod 找不到"上游控制器"
+
+```bash
+kubectl get pod <pod> -n prod -o jsonpath='{.metadata.ownerReferences}'   # 看 controller 字段
+kubectl get deploy -l app=web -n prod        # 顺藤摸到 Deployment
+kubectl describe deployment web -n prod      # 看 Conditions / 新旧 RS / 事件
+# 现象：ownerReferences 为空 → 裸 Pod（无人管理，重启即消失）；指向 RS → 去看那个 RS 为何不扩
+```
+
+> **读法**：Pod 异常先确认"有没有人管它"。裸 Pod 出错只能手动重建；有控制器的 Pod，问题通常在控制器层（副本数/镜像/探针），别在 Pod 上原地改。
 
 ---
 

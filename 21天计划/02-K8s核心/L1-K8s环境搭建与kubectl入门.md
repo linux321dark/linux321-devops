@@ -2,7 +2,7 @@
 
 > **本篇定位**：**先能上手，再懂原理**。本篇只解决两件事：① 选一条建集群的路走通；② kubectl 用到能闭眼敲。
 > **前置**：L0（Shell 与 YAML）。**不要求**先懂 K8s 架构——架构是下一篇 L2 的事。
-> **学完能做什么**：独立用 kind 起集群、在多套环境间切换 context、用 kubectl 排查资源状态；**能说清 kind / kubeadm / ACK 三条路线的差别与各自适用场景**。
+> **学完能做什么**：独立用 kind 起集群、在多套环境间切换 context、用 kubectl 排查资源状态；**能用一组常用运维命令做日常排障**（看日志 / 进容器 / 节点维护 / 回滚清理）；**能说清 kind / kubeadm / ACK 三条路线的差别与各自适用场景**。
 > **在 21 天里**：D2 之前的准备；D7/D14 的整合项目都跑在本地 kind 上。
 > **环境基准**：本机实测 `kubectl v1.37.1`，kind 集群名 `day2`，节点 `day2-control-plane`（`kindest/node:v1.37.0`）。
 > **配套方法**：[`../00-授渔篇-怎么自己搞懂.md`](../00-授渔篇-怎么自己搞懂.md) · **来源规范**：[`../09-参考索引/README.md`](../09-参考索引/README.md)
@@ -32,7 +32,9 @@ L1 K8s 环境搭建与 kubectl 入门
 │   ├─ 3.1 kind 起集群（含多节点）
 │   ├─ 3.2 kubectl 基础操作
 │   ├─ 3.3 多环境 context 管理
-│   └─ 3.4 输出格式与 jsonpath
+│   ├─ 3.4 输出格式与 jsonpath
+│   ├─ 3.5 常用运维命令面板（排障/节点维护/清理/网络/调试/回滚）
+│   └─ 3.6 入门排障实战（3 个场景串命令）
 │
 ├─ 4. 逐字段表
 │
@@ -340,6 +342,194 @@ kubectl get pods --no-headers | awk '{print $1}'             # 只要第一列
 
 ---
 
+## 3.5 常用运维命令面板（按场景）
+
+> **本节能做什么**：3.2 是"增删改查基础"，本节是**每天值班 / 面试都会敲的运维排障命令**——按场景归类，每条配真实例子。**K8s 运维的肌肉记忆就来自这一张表。**
+
+### ① 状态与资源占用
+
+```bash
+kubectl get pods -o wide                          # 看节点/IP（NODE 列是排障第一入口）
+kubectl get pods --sort-by=.status.phase          # 按状态排（Pending/Running/CrashLoop 一眼分）
+kubectl top pods                                  # 看 CPU/内存占用（需装 metrics-server）
+kubectl top nodes                                 # 看节点资源水位
+kubectl get events --sort-by=.lastTimestamp       # 看集群事件，最新在下
+kubectl get events -w                             # 实时跟事件流
+```
+
+> **实战价值**：`top` 是判断"是不是资源打满"的第一步；`events` 是很多故障的真相入口（OOMKilled、FailedScheduling 都写在这里）。
+
+### ② 看日志（排障最高频）
+
+```bash
+kubectl logs <pod>                    # 当前容器日志
+kubectl logs <pod> -f                 # 持续跟随
+kubectl logs <pod> --tail=100         # 只看最后 100 行
+kubectl logs <pod> -p                 # 看上一个崩溃容器的日志（关键！容器重启后当前日志是空的）
+kubectl logs <pod> -c <container>     # 多容器 Pod 指定容器
+kubectl logs <pod> -p -c <container>  # 崩溃容器的指定容器
+```
+
+> **实战价值**：`CrashLoopBackOff` 时**必须用 `-p`**，否则你看到的是重启后的空日志，永远找不到崩溃原因。这是新手最容易踩的坑。
+
+### ③ 进容器排障
+
+```bash
+kubectl exec -it <pod> -- sh                       # 进容器（有 bash 用 bash）
+kubectl exec -it <pod> -c <container> -- sh
+kubectl exec <pod> -- env                          # 不改进容器，直接看环境变量
+kubectl exec <pod> -- cat /etc/resolv.conf         # 看 DNS 配置（排网络问题）
+```
+
+> **实战价值**：镜像没装 shell（distroless）时 `exec` 会失败 → 用 ④ 的 `kubectl debug` 起临时容器。
+
+### ④ 临时调试与文件操作
+
+```bash
+kubectl debug <pod> -it --image=busybox --target=<container>   # 在 Pod 内加临时容器排障（镜像无 shell 时救命）
+kubectl cp <pod>:/path/to/file ./local.file                    # 从 Pod 拷文件出来
+kubectl cp ./local.file <pod>:/path/to/file                    # 拷文件进 Pod
+kubectl proxy                                               # 本地起代理，浏览器访问 apiserver
+kubectl diff -f x.yaml                                      # 预览这次 apply 会改哪些字段（不动手改）
+```
+
+> **实战价值**：`debug` 是镜像无 shell 时的救命命令；`diff` 在改生产前先确认"到底会变什么"，比盲 apply 安全。
+
+### ⑤ 节点维护（上线 / 重启 / 缩容前必做）
+
+```bash
+kubectl get nodes                                                # 看节点状态/角色
+kubectl cordon <node>                                            # 标记不可调度（kubelet 不再放新 Pod）
+kubectl drain <node> --ignore-daemonsets --delete-emptydir-data  # 驱逐 Pod，准备维护
+kubectl uncordon <node>                                          # 维护完，恢复可调度
+```
+
+> **实战价值**：`drain` 前务必先 `cordon`，否则驱逐过程中又有新 Pod 调度进来；`--ignore-daemonsets` 不驱 DS；`--delete-emptydir-data` 显式允许删 emptyDir 数据（默认拒绝）。
+
+### ⑥ 资源清理（别让死 Pod 堆满集群）
+
+```bash
+kubectl delete pod <pod> --grace-period=0 --force                         # 卡在 Terminating 时强删（慎用）
+kubectl delete pods -l app=day1-go                                       # 按 label 批量删
+kubectl delete pods --field-selector=status.phase=Failed                 # 清所有 Failed Pod
+kubectl get pods | grep Evicted | awk '{print $1}' | xargs kubectl delete pod   # 清 Evicted
+kubectl get pods -A | grep -E 'Evicted|Error'                             # 跨命名空间扫异常 Pod
+```
+
+> **实战价值**：Job/CronJob 产生的 Completed Pod、OOM 后残留的 Evicted Pod 会越堆越多，`field-selector` + `grep` 是日常清理两板斧。
+
+### ⑦ 网络排障
+
+```bash
+kubectl port-forward svc/web 18080:80                                # 本地映射 Service 端口，临时访问调试
+kubectl run dnsutils --rm -it --image=registry.k8s.io/e2e-test-images/jessie-dnsutils:1.3 -- nslookup kubernetes.default   # 测集群 DNS
+kubectl exec <pod> -- curl -s http://svc-name:port                  # 进容器测服务连通
+```
+
+> **实战价值**：Service 不通先 `port-forward` 直连验应用本身，再 `dnsutils` 验 DNS，分层定位。
+
+### ⑧ 回滚与权限（改坏 / 没权先看）
+
+```bash
+kubectl rollout status deployment/day1-go        # 看这次发布是否就绪
+kubectl rollout history deployment/day1-go       # 看历史版本
+kubectl rollout undo deployment/day1-go          # 回滚到上一版（救火第一招）
+kubectl rollout undo deployment/day1-go --to-revision=2   # 回滚到指定版本
+kubectl auth can-i get pods -n prod              # 我有没有这个权限（403 时查）
+kubectl auth can-i --list                        # 列出我所有权限
+```
+
+> **实战价值**：发布翻车第一反应不是改 yaml 重发，而是 `rollout undo` 先恢复；`auth can-i` 把"没权限"和"资源不存在"一眼分开。
+
+### ⑨ Helm 包管理（把 kubectl 管不了的一整包应用一次装好）
+
+> **为什么要有 Helm**：`kubectl apply -f` 一次只能管一个 yaml，而一个真实应用 = Deployment + Service + Ingress + ConfigMap + Secret + HPA……十几个资源。**Helm 用"Chart（模板包）+ values（配置）"把这一整包参数化，一条命令装/升/回滚。** 面试里"会 Helm"是配置管理岗的硬门槛。
+
+```bash
+# 0) 仓库：先把 Chart 源加上，并保持最新
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm repo update
+helm search repo nginx                  # 在已加仓库里搜 Chart
+
+# 1) 安装：从仓库装 / 从本地 Chart 目录装，两种方式
+helm install my-nginx bitnami/nginx -n prod --create-namespace
+helm install my-nginx ./my-chart -n prod --create-namespace
+
+# 2) values 覆盖（面试常问"怎么区分环境"）：-f 多文件后者覆盖前者，--set 优先级最高
+helm install my-nginx ./my-chart -f values-base.yaml -f values-prod.yaml --set replicaCount=3 --set image.tag=v1.2.3 -n prod
+helm upgrade my-nginx ./my-chart -f values-prod.yaml --set image.tag=v1.2.3 -n prod   # 升级（改镜像/配置）
+
+# 3) 版本与回滚（救火核心，和 kubectl rollout undo 互补）
+helm history my-nginx -n prod            # 看每次 release 的 REVISION
+helm rollback my-nginx 2 -n prod         # 回滚到指定 REVISION（也是新建一个 revision）
+helm list -n prod -a                     # -a 含已卸载；看 release 状态
+helm status my-nginx -n prod             # 当前 release 详情
+
+# 4) 依赖与打包（自己写 Chart 时）
+helm dependency build ./my-chart         # 拉取 Chart.yaml 里声明的依赖到 charts/
+helm dependency update ./my-chart        # 更新依赖版本
+helm package ./my-chart                  # 打成 .tgz，可用于私有仓库分发
+
+# 5) 渲染与校验（上生产前必做，等效 kubectl diff）
+helm template my-nginx ./my-chart -f values-prod.yaml          # 本地渲染出最终 yaml，不提交集群
+helm lint ./my-chart                                      # 静态检查 Chart 语法/最佳实践
+helm get values my-nginx -n prod                          # 看这次 release 实际生效的 values
+helm get manifest my-nginx -n prod                        # 看这次 release 实际提交的资源清单
+
+# 6) 卸载
+helm uninstall my-nginx -n prod
+```
+
+> **实战价值**：
+> - **`helm template` 是上生产前的"试衣镜"**——先把最终 yaml 渲出来人工/流水线检查，再 `upgrade`，避免盲装。
+> - **回滚也是"新建 revision"**，所以 `helm history` 的 REVISION 只增不减，和 `kubectl rollout history` 一个道理——别以为回滚会"回到旧号"。
+> - **values 优先级**：`--set` > 最后一个 `-f` 文件 > 前面的 `-f` 文件 > Chart 内置 `values.yaml`。多环境就靠这套覆盖，而不是维护多份 yaml。
+> - **`helm get values --revision=N`** 能回看任意历史版本的配置，复盘"上次到底改了啥"靠它。
+
+---
+
+## 3.6 入门排障实战（3 个场景串命令）
+
+> **把 3.5 的命令用起来**：三个最典型的入门故障，按"现象 → 敲的命令 → 怎么读"走一遍。**都在 kind 集群上练，别在真集群试。**
+
+### 场景 A：Pod 一直 Pending（调度不出去）
+
+```bash
+kubectl get pods -o wide        # 现象：STATUS=Pending，NODE 为空
+kubectl describe pod <pod>      # 翻到 Events 段
+# 典型输出：FailedScheduling: 0/3 nodes are available: 3 Insufficient cpu.
+kubectl top nodes               # 确认节点 CPU 是否打满
+```
+
+> **读法**：Pending = 没被调度。`describe` 的 Events 直接说原因（资源不够 / 污点不匹配 / PVC 没绑）。**别猜，看 Events。**
+
+### 场景 B：CrashLoopBackOff（容器起不来）
+
+```bash
+kubectl get pods                # 现象：CrashLoopBackOff，RESTARTS 在涨
+kubectl logs <pod> -p --tail=50 # 看崩溃前日志（关键 -p）
+kubectl describe pod <pod>      # 看 Last State / Exit Code / Reason
+# 典型：Exit Code 1（应用报错）/ OOMKilled（Exit Code 137，内存超限）
+```
+
+> **读法**：`logs -p` 拿到崩溃瞬间日志；`describe` 的 Last State 给退出码。Exit 137 = OOM（加内存 limit），非 0 = 应用自身错误（看日志）。
+
+### 场景 C：节点要维护（重启 / 升级）
+
+```bash
+kubectl cordon <node>                                              # 先封锁，不再调度新 Pod
+kubectl drain <node> --ignore-daemonsets --delete-emptydir-data    # 驱逐现有 Pod
+# 等 Drain 完成 → 节点做维护/重启
+kubectl get nodes                                                  # 确认节点 Ready
+kubectl uncordon <node>                                            # 恢复可调度
+```
+
+> **读法**：`drain` 会逐个把 Pod 移到别的节点（Deployment 类自动重建）；DaemonSet 和不带控制器管理的裸 Pod 会挡住 drain，需 `--ignore-daemonsets` 或单独处理。
+
+> **三个场景的共同心法**：**先 `get`/看状态 → 再 `describe`/看 Events 或 `logs -p` 看原因 → 最后才是修**。90% 的入门故障卡在"没看 Events 就乱改"。
+
+---
+
 ## 4. 逐字段表
 
 ### 4.1 kubeconfig 关键字段
@@ -432,6 +622,7 @@ kubectl get pods --no-headers | awk '{print $1}'             # 只要第一列
 1. **能说清输入输出吗？** —— 输入：kubectl 命令（本质是 API 请求）；输出：apiserver 写 etcd，controller 协调出实际态，kubectl 再把结果读回来。中间经过 kubeconfig（定身份/集群/命名空间）→ 认证 → 授权 → 准入 → etcd。
 2. **能故意改坏再倒推吗？** —— 四个实验：① 切到不存在的 context → 看报错怎么变；② 删掉 kubeconfig 的 `current-context` → 看 "current-context is not set"；③ 在 `default` ns 建资源但不带 `-n` 去别的 ns 查 → 看"消失"；④ 用 `-n kube-system` 删一个 Pod → 看集群怎么反应（**这是危险实验，只在 kind 上做**）。
 3. **能画上下游吗？** —— 画出「你 → kubectl → kubeconfig → apiserver → etcd → controller/scheduler → kubelet → 容器」这条链，并在每一段标出"这段挂了你会看到什么"（认证/授权/准入/连接/超时各对应不同报错）。
+4. **能按场景掏出命令吗？** —— 给四个现象从 3.5 里挑命令：① Pod 卡 Pending → `describe` 看 Events；② CrashLoopBackOff → `logs -p` 看崩溃前日志；③ 节点要升级 → `cordon` → `drain` → `uncordon`；④ 发布翻车 → 先 `rollout undo` 或回 Git 重新 `apply`，不是改 yaml 重发。
 
 ---
 

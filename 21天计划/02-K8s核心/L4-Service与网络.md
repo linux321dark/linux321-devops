@@ -977,4 +977,55 @@ kubectl exec -it <pod> -- ss -lntp           # ⑥ 容器里到底有没有在�
 
 ---
 
+## 9. 常用运维命令（Service / 网络排障速查）
+
+> **本节能做什么**：L4 讲的是 Service 怎么把流量导到 Pod，本节把**网络连通性排障的高频命令**按场景归类——端点（Endpoint）校验、端口转发临时连通、DNS 与网络策略核查，以及"Service 不通"的实战排障。**Endpoint 为空是 90% Service 故障的根因。**
+
+### ① Service / Endpoint 端点校验（第一入口）
+
+```bash
+kubectl get svc -n prod -o wide                        # 看类型/ClusterIP/端口/外部 IP
+kubectl describe svc web -n prod                       # 看 Selector / Endpoints / Type / 事件
+kubectl get endpoints web -n prod                      # 看后端 Pod IP:端口 列表（最关键）
+kubectl get endpointslices -n prod                     # v1.21+ 端点分片（大规模性能优化）
+kubectl get pods -n prod -l app=web -o wide            # 交叉验证 selector 真能选中 Pod 且 Ready
+```
+
+> **实战价值**：Service 不通，**第一眼看 `endpoints` 是否为空**。空 = selector 没匹配到 Ready 的 Pod（label 拼错 / Pod 没就绪），和 apiserver 没关系。
+
+### ② 端口转发与临时连通测试
+
+```bash
+kubectl port-forward svc/web 18080:80 -n prod          # 本地映射 Service（临时调试）
+kubectl port-forward pod/<pod> 18080:80 -n prod        # 直连某个 Pod
+kubectl port-forward deploy/web 18080:80 -n prod       # 直连 Deployment 选中的某个 Pod
+kubectl exec -it <pod> -n prod -- curl -s http://web:80   # 进容器测服务间调用
+```
+
+> **实战价值**：`port-forward` 是"绕过 Ingress/SLB 直连应用本身"的分层定位工具——先确认应用本身能响应，再往上去查 Service/Ingress/网络策略。
+
+### ③ DNS 与网络策略核查
+
+```bash
+kubectl run dnsutils --rm -it --image=registry.k8s.io/e2e-test-images/jessie-dnsutils:1.3 -n prod -- nslookup web.prod.svc.cluster.local
+kubectl exec <pod> -n prod -- cat /etc/resolv.conf     # 看 Pod 内 DNS 配置（search 域）
+kubectl get networkpolicy -n prod                      # 列出生效的网络策略
+kubectl describe networkpolicy <np> -n prod            # 看入站/出站规则（是否被策略挡住）
+```
+
+> **实战价值**：服务间调用超时先分两层——`nslookup` 验 DNS 是否能解析，再看 NetworkPolicy 是否把流量挡了（很多"通不了"其实是策略把 Pod 隔离了）。
+
+### ④ 排障实战：访问 Service 返回 503 / 连不上
+
+```bash
+kubectl get endpoints web -n prod                # 空 → 后端没有就绪 Pod
+kubectl get pods -l app=web -n prod -o wide      # Pod Ready 吗？RESTARTS 异常吗？
+kubectl describe svc web -n prod                 # Selector 与后端 Service 对得上吗？
+# 现象：endpoints 空 + Pod 非 Ready → 修 Pod（探针/镜像）；endpoints 有但 503 → 应用层错误
+```
+
+> **读法**：503/连接拒绝按"端点 → Pod 就绪 → 应用"三层定位。Endpoint 空是 Service 层问题（selector/labels），Endpoint 有但报错是应用层问题，别混淆。
+
+---
+
 **下一篇**：[`L5-Ingress与配置管理`](L5-Ingress与配置管理.md)（**Ingress 只是一份路由配置 · pathType 三种取值 · 注解是厂商扩展 · ConfigMap 三种消费方式 · base64 不是加密**） · **上一篇**：[`L3-Deployment与滚动更新`](L3-Deployment与滚动更新.md) · **上一级**：[`00-学习地图与前置依赖`](../00-学习地图与前置依赖.md)
